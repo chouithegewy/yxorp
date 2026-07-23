@@ -44,12 +44,24 @@ impl From<std::io::Error> for FastH1Error {
 
 #[derive(Clone)]
 struct SelectedUpstream {
-    authority: String,
-    host_header: Vec<u8>,
     protocol: UpstreamProtocol,
     connect_timeout: Duration,
     request_timeout: Duration,
     state: Arc<UpstreamState>,
+}
+
+impl SelectedUpstream {
+    fn authority(&self) -> &str {
+        self.state.authority().as_str()
+    }
+
+    fn host_header_bytes(&self) -> &[u8] {
+        self.state.host_header().as_bytes()
+    }
+
+    fn id(&self) -> usize {
+        self.state.id()
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -72,13 +84,16 @@ struct ResponseHead {
     body: BodyKind,
 }
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-
 const POOL_SHARDS: usize = 32;
 
+/// Idle keepalive connections to upstreams, sharded to reduce lock contention and
+/// keyed by the stable per-upstream id (see `UpstreamState::id`) so checkin/checkout
+/// need neither a `String` allocation nor authority hashing on the hot path. Each
+/// entry records when it was returned to the pool so the liveness probe can be
+/// skipped for connections reused within the configured idle threshold.
 pub struct FastConnectionPool {
-    shards: [std::sync::Mutex<std::collections::HashMap<String, Vec<TcpStream>>>; POOL_SHARDS],
+    shards: [std::sync::Mutex<std::collections::HashMap<usize, Vec<(TcpStream, Instant)>>>;
+        POOL_SHARDS],
 }
 
 impl FastConnectionPool {
@@ -90,46 +105,30 @@ impl FastConnectionPool {
         }
     }
 
-    fn shard_idx(authority: &str) -> usize {
-        let mut hasher = DefaultHasher::new();
-        authority.hash(&mut hasher);
-        (hasher.finish() as usize) % POOL_SHARDS
+    fn shard_idx(id: usize) -> usize {
+        id % POOL_SHARDS
     }
 
-    pub fn checkout(&self, authority: &str) -> Option<TcpStream> {
-        let idx = Self::shard_idx(authority);
+    pub fn checkout(&self, id: usize, idle_threshold: Duration) -> Option<TcpStream> {
+        let idx = Self::shard_idx(id);
         let mut guard = self.shards[idx].lock().unwrap();
-        if let Some(conns) = guard.get_mut(authority) {
-            while let Some(conn) = conns.pop() {
-                if is_connection_alive(&conn) {
-                    tracing::trace!(
-                        authority = authority,
-                        shard = idx,
-                        "checkout connection pool hit"
-                    );
+        if let Some(conns) = guard.get_mut(&id) {
+            while let Some((conn, idle_since)) = conns.pop() {
+                // Hot keepalive reuse (idle under the threshold) skips the
+                // recv(MSG_PEEK) syscall; only longer-idle connections are probed.
+                if idle_since.elapsed() < idle_threshold || is_connection_alive(&conn) {
                     return Some(conn);
-                } else {
-                    tracing::debug!(
-                        authority = authority,
-                        shard = idx,
-                        "checkout dropping dead connection"
-                    );
                 }
+                tracing::debug!(upstream_id = id, shard = idx, "checkout dropping dead connection");
             }
         }
-        tracing::trace!(
-            authority = authority,
-            shard = idx,
-            "checkout connection pool miss"
-        );
         None
     }
 
-    pub fn checkin(&self, authority: String, conn: TcpStream) {
-        let idx = Self::shard_idx(&authority);
+    pub fn checkin(&self, id: usize, conn: TcpStream) {
+        let idx = Self::shard_idx(id);
         let mut guard = self.shards[idx].lock().unwrap();
-        guard.entry(authority.clone()).or_default().push(conn);
-        tracing::trace!(authority = %authority, shard = idx, "checkin connection to pool");
+        guard.entry(id).or_default().push((conn, Instant::now()));
     }
 }
 
@@ -157,14 +156,15 @@ fn is_connection_alive(stream: &TcpStream) -> bool {
 async fn get_connection(
     pool: &FastConnectionPool,
     upstream: &SelectedUpstream,
+    idle_threshold: Duration,
 ) -> std::io::Result<TcpStream> {
-    if let Some(stream) = pool.checkout(&upstream.authority) {
+    if let Some(stream) = pool.checkout(upstream.id(), idle_threshold) {
         return Ok(stream);
     }
-    tracing::debug!(authority = %upstream.authority, "opening new upstream connection");
+    tracing::debug!(authority = %upstream.authority(), "opening new upstream connection");
     let stream = tokio::time::timeout(
         upstream.connect_timeout,
-        TcpStream::connect(upstream.authority.as_str()),
+        TcpStream::connect(upstream.authority()),
     )
     .await
     .map_err(|_| {
@@ -181,6 +181,7 @@ pub async fn serve_connection(
     mut downstream: TcpStream,
 ) -> Result<()> {
     tracing::debug!("accepted new h1 downstream connection");
+    let idle_threshold = snapshot.config.runtime.liveness_probe_idle();
     let mut downstream_buf = Vec::with_capacity(READ_CHUNK_BYTES);
     let mut upstream_buf = Vec::with_capacity(READ_CHUNK_BYTES);
     let mut outbound_buf = Vec::with_capacity(READ_CHUNK_BYTES);
@@ -256,7 +257,7 @@ pub async fn serve_connection(
         let request_body = request.head.body;
         let request_timeout = request.upstream.request_timeout;
 
-        let mut upstream_stream = match get_connection(&pool, &request.upstream).await {
+        let mut upstream_stream = match get_connection(&pool, &request.upstream, idle_threshold).await {
             Ok(stream) => stream,
             Err(_) => {
                 request.upstream.state.mark_failure();
@@ -348,7 +349,7 @@ pub async fn serve_connection(
                     || response.body == BodyKind::CloseDelimited;
 
                 if !close_conn {
-                    pool.checkin(request.upstream.authority.clone(), upstream_stream);
+                    pool.checkin(request.upstream.id(), upstream_stream);
                 }
 
                 if close_conn {
@@ -420,12 +421,10 @@ fn build_request(
     let rate_limiter = route_match.rate_limiter;
     let upstream_path = upstream.upstream_path_and_query(path_and_query);
     let selected = SelectedUpstream {
-        authority: upstream.authority().as_str().to_string(),
-        host_header: upstream.host_header().as_bytes().to_vec(),
         protocol: upstream.config.protocol,
         connect_timeout: Duration::from_millis(upstream.config.connect_timeout_ms),
         request_timeout: Duration::from_millis(upstream.config.request_timeout_ms),
-        state: Arc::clone(&upstream),
+        state: upstream,
     };
 
     let close_after_response = request_wants_close(http10, parsed.headers);
@@ -436,7 +435,7 @@ fn build_request(
     outbound.extend_from_slice(b" ");
     outbound.extend_from_slice(upstream_path.as_bytes());
     outbound.extend_from_slice(b" HTTP/1.1\r\nHost: ");
-    outbound.extend_from_slice(&selected.host_header);
+    outbound.extend_from_slice(selected.host_header_bytes());
     outbound.extend_from_slice(b"\r\nConnection: keep-alive\r\n");
     append_forward_headers(outbound, parsed.headers, body);
     outbound.extend_from_slice(b"\r\n");
@@ -895,7 +894,7 @@ fn emit_access_log(
             status = status,
             duration_ms = duration,
             client_ip = %client_ip,
-            upstream = %request.upstream.authority,
+            upstream = %request.upstream.authority(),
         );
     }
 }
@@ -936,6 +935,26 @@ mod tests {
             "inline",
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn pool_checkout_is_idle_gated_and_id_keyed() {
+        use std::time::Duration;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _c = listener.accept().await.unwrap();
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+        let client = TcpStream::connect(addr).await.unwrap();
+        let pool = FastConnectionPool::new();
+        pool.checkin(7, client);
+        // Fresh checkin is available under its own id and skips the probe; a
+        // different id sees nothing.
+        assert!(pool.checkout(9, Duration::from_millis(250)).is_none());
+        assert!(pool.checkout(7, Duration::from_millis(250)).is_some());
     }
 
     #[test]
