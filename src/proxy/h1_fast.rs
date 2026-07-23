@@ -182,6 +182,7 @@ pub async fn serve_connection(
 ) -> Result<()> {
     tracing::debug!("accepted new h1 downstream connection");
     let idle_threshold = snapshot.config.runtime.liveness_probe_idle();
+    let zero_copy = snapshot.config.runtime.zero_copy;
     let mut downstream_buf = Vec::with_capacity(READ_CHUNK_BYTES);
     let mut upstream_buf = Vec::with_capacity(READ_CHUNK_BYTES);
     let mut outbound_buf = Vec::with_capacity(READ_CHUNK_BYTES);
@@ -297,6 +298,7 @@ pub async fn serve_connection(
                 &mut upstream_stream,
                 request_body,
                 Some(MAX_REQUEST_BODY_BYTES),
+                zero_copy,
             ),
         )
         .await
@@ -329,6 +331,7 @@ pub async fn serve_connection(
                 &mut upstream_buf,
                 &mut downstream,
                 request.head.head_response,
+                zero_copy,
             ),
         )
         .await
@@ -463,6 +466,7 @@ async fn read_and_forward_response(
     upstream_buf: &mut Vec<u8>,
     downstream: &mut TcpStream,
     head_response: bool,
+    zero_copy: bool,
 ) -> Result<ResponseHead> {
     loop {
         let header_end = read_header_block(upstream, upstream_buf)
@@ -494,9 +498,10 @@ async fn read_and_forward_response(
             BodyKind::ContentLength(length) => {
                 // Bytes of the body already sent as part of the coalesced write.
                 let already_sent = coalesced - header_end;
-                copy_exact_body(upstream, upstream_buf, downstream, length - already_sent).await?;
+                copy_exact_body(upstream, upstream_buf, downstream, length - already_sent, zero_copy)
+                    .await?;
             }
-            _ => copy_body(upstream, upstream_buf, downstream, response.body, None).await?,
+            _ => copy_body(upstream, upstream_buf, downstream, response.body, None, zero_copy).await?,
         }
         downstream.flush().await?;
         return Ok(response);
@@ -570,17 +575,26 @@ async fn copy_body(
     dst: &mut TcpStream,
     body: BodyKind,
     max_body_bytes: Option<usize>,
+    zero_copy: bool,
 ) -> Result<()> {
     match body {
         BodyKind::None => Ok(()),
-        BodyKind::ContentLength(length) => copy_exact_body(src, src_buf, dst, length).await,
-        BodyKind::Chunked => copy_chunked_body(src, src_buf, dst, max_body_bytes).await,
+        BodyKind::ContentLength(length) => {
+            copy_exact_body(src, src_buf, dst, length, zero_copy).await
+        }
+        BodyKind::Chunked => copy_chunked_body(src, src_buf, dst, max_body_bytes, zero_copy).await,
         BodyKind::CloseDelimited => {
             if !src_buf.is_empty() {
                 dst.write_all(src_buf).await?;
                 src_buf.clear();
             }
-            tokio::io::copy(src, dst).await?;
+            if zero_copy && crate::proxy::zerocopy::splice_supported() {
+                // Reborrow as shared: distinct sockets, no aliasing, and async_io
+                // needs only &TcpStream.
+                crate::proxy::zerocopy::splice_stream(&*src, &*dst).await?;
+            } else {
+                tokio::io::copy(src, dst).await?;
+            }
             Ok(())
         }
     }
@@ -591,12 +605,22 @@ async fn copy_exact_body(
     src_buf: &mut Vec<u8>,
     dst: &mut TcpStream,
     mut remaining: usize,
+    zero_copy: bool,
 ) -> Result<()> {
     let buffered = src_buf.len().min(remaining);
     if buffered > 0 {
         dst.write_all(&src_buf[..buffered]).await?;
         discard_buffer_prefix(src_buf, buffered);
         remaining -= buffered;
+    }
+    if remaining == 0 {
+        return Ok(());
+    }
+    // Zero-copy: splice the socket-resident remainder straight to the peer, no
+    // userspace buffer. src_buf is drained above, so nothing is left behind.
+    if zero_copy && crate::proxy::zerocopy::splice_supported() {
+        crate::proxy::zerocopy::splice_exact(&*src, &*dst, remaining).await?;
+        return Ok(());
     }
     let mut scratch = [0_u8; READ_CHUNK_BYTES];
     while remaining > 0 {
@@ -616,6 +640,7 @@ async fn copy_chunked_body(
     src_buf: &mut Vec<u8>,
     dst: &mut TcpStream,
     max_body_bytes: Option<usize>,
+    zero_copy: bool,
 ) -> Result<()> {
     let mut copied = 0usize;
     loop {
@@ -646,7 +671,7 @@ async fn copy_chunked_body(
         {
             return Err(FastH1Error::Parse("request body too large"));
         }
-        copy_exact_body(src, src_buf, dst, size + 2).await?;
+        copy_exact_body(src, src_buf, dst, size + 2, zero_copy).await?;
     }
 }
 
@@ -957,6 +982,72 @@ mod tests {
             "inline",
         )
         .unwrap()
+    }
+
+    fn fast_snapshot_no_zero_copy(upstream_addr: impl std::fmt::Display) -> ConfigSnapshot {
+        ConfigSnapshot::parse(
+            &format!(
+                r#"
+                [runtime]
+                zero_copy = false
+
+                [[routes]]
+                name = "root"
+                host = "*"
+                path_prefix = "/"
+                upstream_pool = "web"
+
+                [upstream_pools.web]
+                [[upstream_pools.web.upstreams]]
+                name = "web"
+                url = "http://{upstream_addr}"
+                protocol = "h1"
+                weight = 1
+                "#
+            ),
+            "inline",
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn proxies_large_response_with_zero_copy_disabled_matches() {
+        // The buffered fallback path must reproduce the same bytes as the splice
+        // path. Drive the full proxy with zero_copy = false.
+        let body: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let server_body = body.clone();
+        tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let _ = read_header_block(&mut stream, &mut buf).await.unwrap().unwrap();
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                server_body.len()
+            );
+            stream.write_all(header.as_bytes()).await.unwrap();
+            stream.write_all(&server_body).await.unwrap();
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let snapshot = Arc::new(fast_snapshot_no_zero_copy(upstream_addr));
+        let pool = Arc::new(FastConnectionPool::new());
+        tokio::spawn(async move {
+            let (stream, _) = proxy.accept().await.unwrap();
+            let _ = serve_connection(snapshot, pool, stream).await;
+        });
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        client
+            .write_all(b"GET /large HTTP/1.1\r\nHost: example.test\r\n\r\n")
+            .await
+            .unwrap();
+        assert_eq!(read_client_body(&mut client).await, body);
     }
 
     #[tokio::test]
