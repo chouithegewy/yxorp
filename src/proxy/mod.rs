@@ -218,6 +218,12 @@ impl ProxyRuntime {
         let h1_only = listener.protocols == [ListenerProtocol::H1];
         let fast_h1 = listener.http1_engine == Http1Engine::Fast;
         if listener.http1_engine == Http1Engine::Uring {
+            #[cfg(feature = "single-core")]
+            warn!(
+                listener = listener.name,
+                "uring engine on a single-core build: the fast engine is recommended \
+                 (io_uring submit/complete overhead rarely amortizes on one core)"
+            );
             return h1_uring::serve_listener(
                 self.snapshot,
                 listener,
