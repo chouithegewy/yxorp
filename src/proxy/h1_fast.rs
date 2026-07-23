@@ -11,6 +11,12 @@ use tokio::time::{Duration, timeout};
 use crate::config::{ConfigSnapshot, UpstreamProtocol, UpstreamState};
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
+// Single-core builds use larger body chunks to cut read+write syscalls per MiB
+// (~4×), which the HAProxy single-thread baseline showed is the dominant large-body
+// gap on one core. Multi-core keeps 16 KiB to bound per-connection memory.
+#[cfg(feature = "single-core")]
+const READ_CHUNK_BYTES: usize = 64 * 1024;
+#[cfg(not(feature = "single-core"))]
 const READ_CHUNK_BYTES: usize = 16 * 1024;
 const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
 const DOWNSTREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1008,6 +1014,16 @@ mod tests {
             "inline",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn read_chunk_size_matches_build_profile() {
+        let expected = if cfg!(feature = "single-core") {
+            64 * 1024
+        } else {
+            16 * 1024
+        };
+        assert_eq!(READ_CHUNK_BYTES, expected);
     }
 
     #[tokio::test]

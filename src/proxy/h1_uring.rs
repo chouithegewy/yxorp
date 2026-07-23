@@ -16,6 +16,10 @@ use tracing::{error, info, warn};
 use crate::config::{ConfigSnapshot, ListenerConfig, UpstreamProtocol, UpstreamState};
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
+// Single-core builds use larger body chunks to cut syscalls per MiB. See h1_fast.
+#[cfg(feature = "single-core")]
+const READ_CHUNK_BYTES: usize = 64 * 1024;
+#[cfg(not(feature = "single-core"))]
 const READ_CHUNK_BYTES: usize = 16 * 1024;
 const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
 const DOWNSTREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(10);

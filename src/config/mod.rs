@@ -740,7 +740,10 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             drain_timeout_ms: 30_000,
-            zero_copy: true,
+            // Splice zero-copy defaults off on single-core builds: it trades a cheap
+            // memcpy for extra syscalls/wakeups that dominate on one core. Still
+            // enable-able via config for latency-sensitive or multi-core-NIC use.
+            zero_copy: !cfg!(feature = "single-core"),
             liveness_probe_idle_ms: 250,
         }
     }
@@ -1194,16 +1197,19 @@ mod tests {
     }
 
     #[test]
-    fn runtime_defaults_enable_zero_copy() {
+    fn runtime_defaults_match_build_profile() {
         let cfg = RuntimeConfig::default();
-        assert!(cfg.zero_copy);
+        // zero_copy defaults on for multi-core builds and off for single-core builds
+        // (splice is a CPU-bound loss on one core; see the single-core baseline).
+        assert_eq!(cfg.zero_copy, !cfg!(feature = "single-core"));
         assert_eq!(cfg.liveness_probe_idle_ms, 250);
         assert_eq!(cfg.liveness_probe_idle().as_millis(), 250);
     }
 
     #[test]
     fn runtime_omitted_fields_use_defaults() {
-        // A config with no [runtime] table must still parse and default zero_copy on.
+        // A config with no [runtime] table must still parse and take the build's
+        // zero_copy default.
         let toml = r#"
             [[routes]]
             name = "r"
@@ -1216,7 +1222,7 @@ mod tests {
             url = "http://127.0.0.1:9000"
         "#;
         let snap = ConfigSnapshot::parse(toml, "inline").unwrap();
-        assert!(snap.config.runtime.zero_copy);
+        assert_eq!(snap.config.runtime.zero_copy, !cfg!(feature = "single-core"));
     }
 
     fn sample() -> &'static str {
