@@ -975,10 +975,15 @@ impl UpstreamPool {
     }
 }
 
+/// Process-global monotonic source of stable per-upstream ids. Used to key the
+/// fast engine's connection pool without hashing the authority string per request.
+static NEXT_UPSTREAM_ID: AtomicUsize = AtomicUsize::new(0);
+
 #[derive(Debug)]
 pub struct UpstreamState {
     pub config: UpstreamConfig,
     uri_base: UpstreamUriBase,
+    id: usize,
     connect_addr: OnceLock<SocketAddr>,
     passive_failures: AtomicUsize,
     active_healthy: std::sync::atomic::AtomicBool,
@@ -990,10 +995,17 @@ impl UpstreamState {
         Self {
             config,
             uri_base,
+            id: NEXT_UPSTREAM_ID.fetch_add(1, Ordering::Relaxed),
             connect_addr: OnceLock::new(),
             passive_failures: AtomicUsize::new(0),
             active_healthy: std::sync::atomic::AtomicBool::new(true),
         }
+    }
+
+    /// Stable, process-unique id assigned at construction. Cheap integer key for
+    /// the fast connection pool.
+    pub fn id(&self) -> usize {
+        self.id
     }
 
     pub fn build_uri(&self, path_and_query: &str) -> Result<Uri, http::Error> {
@@ -1158,6 +1170,28 @@ fn resolve_socket_addr(authority: &str) -> std::io::Result<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_states_have_unique_ids() {
+        let toml = r#"
+            [[routes]]
+            name = "r"
+            host = "*"
+            path_prefix = "/"
+            upstream_pool = "web"
+            [upstream_pools.web]
+            [[upstream_pools.web.upstreams]]
+            name = "a"
+            url = "http://127.0.0.1:9000"
+            [[upstream_pools.web.upstreams]]
+            name = "b"
+            url = "http://127.0.0.1:9001"
+        "#;
+        let snap = ConfigSnapshot::parse(toml, "inline").unwrap();
+        let ups = snap.routes.all_upstreams();
+        assert_eq!(ups.len(), 2);
+        assert_ne!(ups[0].id(), ups[1].id());
+    }
 
     #[test]
     fn runtime_defaults_enable_zero_copy() {
