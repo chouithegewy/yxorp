@@ -34,6 +34,7 @@ pub mod rate_limit;
 mod h3_quiche;
 
 pub mod ebpf;
+pub mod zerocopy;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type ProxyBody = BoxBody<Bytes, BoxError>;
