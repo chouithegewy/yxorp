@@ -60,3 +60,7 @@ harness = false
 [[bench]]
 name = "bench_pool"
 harness = false
+
+[[bench]]
+name = "bench_body_forward"
+harness = false
