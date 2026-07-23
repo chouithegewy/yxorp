@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>yxorp | Edge Proxy Admin</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-color: #0b0c10;
+            --surface: rgba(31, 33, 42, 0.65);
+            --surface-border: rgba(255, 255, 255, 0.08);
+            --text-primary: #ffffff;
+            --text-secondary: #8c92a6;
+            --accent: #00f0ff;
+            --accent-glow: rgba(0, 240, 255, 0.4);
+            --danger: #ff2a5f;
+            --danger-glow: rgba(255, 42, 95, 0.4);
+            --success: #00ff88;
+            --success-glow: rgba(0, 255, 136, 0.4);
+            --warning: #ffaa00;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-color);
+            background-image: 
+                radial-gradient(circle at 15% 50%, rgba(0, 240, 255, 0.05), transparent 25%),
+                radial-gradient(circle at 85% 30%, rgba(255, 42, 95, 0.05), transparent 25%);
+            color: var(--text-primary);
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 24px 48px;
+            background: rgba(11, 12, 16, 0.8);
+            backdrop-filter: blur(12px);
+            border-bottom: 1px solid var(--surface-border);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        h1 {
+            font-family: 'Outfit', sans-serif;
+            font-size: 28px;
+            font-weight: 700;
+            background: linear-gradient(135deg, #fff 0%, #8c92a6 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            letter-spacing: -0.5px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        h1::before {
+            content: '';
+            display: block;
+            width: 16px;
+            height: 16px;
+            background: var(--accent);
+            border-radius: 50%;
+            box-shadow: 0 0 16px var(--accent-glow);
+        }
+
+        .controls {
+            display: flex;
+            gap: 16px;
+        }
+
+        button {
+            font-family: 'Inter', sans-serif;
+            font-weight: 600;
+            font-size: 14px;
+            padding: 10px 20px;
+            border-radius: 8px;
+            cursor: pointer;
+            border: 1px solid var(--surface-border);
+            background: var(--surface);
+            color: var(--text-primary);
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            backdrop-filter: blur(8px);
+            position: relative;
+            overflow: hidden;
+        }
+
+        button::after {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 50%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.1), transparent);
+            transform: skewX(-20deg);
+        }
+
+        button:hover::after {
+            animation: shine 0.6s;
+        }
+
+        @keyframes shine {
+            100% { left: 150%; }
+        }
+
+        button.primary {
+            border-color: var(--accent);
+            color: var(--accent);
+        }
+
+        button.primary:hover {
+            background: var(--accent);
+            color: var(--bg-color);
+            box-shadow: 0 0 20px var(--accent-glow);
+        }
+
+        button.danger:hover {
+            border-color: var(--danger);
+            background: var(--danger);
+            color: var(--text-primary);
+            box-shadow: 0 0 20px var(--danger-glow);
+        }
+
+        main {
+            padding: 48px;
+            max-width: 1400px;
+            margin: 0 auto;
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 32px;
+        }
+
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 24px;
+        }
+
+        .card {
+            background: var(--surface);
+            border: 1px solid var(--surface-border);
+            border-radius: 16px;
+            padding: 24px;
+            backdrop-filter: blur(16px);
+            transition: transform 0.3s, box-shadow 0.3s;
+        }
+
+        .card:hover {
+            transform: translateY(-4px);
+            border-color: rgba(255,255,255,0.15);
+            box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+        }
+
+        .metric-value {
+            font-family: 'Outfit', sans-serif;
+            font-size: 42px;
+            font-weight: 700;
+            margin-top: 12px;
+            color: var(--accent);
+            text-shadow: 0 0 24px var(--accent-glow);
+        }
+
+        .metric-label {
+            font-size: 14px;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            font-weight: 600;
+        }
+
+        h2 {
+            font-family: 'Outfit', sans-serif;
+            font-size: 22px;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            display: inline-block;
+        }
+
+        .status-healthy { background: var(--success); box-shadow: 0 0 10px var(--success-glow); }
+        .status-degraded { background: var(--warning); box-shadow: 0 0 10px rgba(255, 170, 0, 0.4); }
+        .status-dead { background: var(--danger); box-shadow: 0 0 10px var(--danger-glow); }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        th, td {
+            padding: 16px;
+            text-align: left;
+            border-bottom: 1px solid var(--surface-border);
+        }
+
+        th {
+            color: var(--text-secondary);
+            font-weight: 600;
+            font-size: 13px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        tr {
+            transition: background 0.2s;
+        }
+
+        tr:hover {
+            background: rgba(255, 255, 255, 0.03);
+        }
+
+        td {
+            font-size: 15px;
+        }
+
+        .code-pill {
+            font-family: 'Courier New', Courier, monospace;
+            background: rgba(0,0,0,0.5);
+            padding: 4px 8px;
+            border-radius: 6px;
+            font-size: 13px;
+            color: var(--accent);
+            border: 1px solid var(--surface-border);
+        }
+
+        .toast-container {
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            z-index: 1000;
+        }
+
+        .toast {
+            background: var(--surface);
+            border: 1px solid var(--surface-border);
+            padding: 16px 24px;
+            border-radius: 8px;
+            backdrop-filter: blur(12px);
+            transform: translateX(120%);
+            transition: transform 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+        }
+
+        .toast.show {
+            transform: translateX(0);
+        }
+
+    </style>
+</head>
+<body>
+    <header>
+        <h1>yxorp</h1>
+        <div class="controls">
+            <button class="primary" onclick="actionReload()">Reload Config</button>
+            <button class="danger" onclick="actionDrain()">Drain Traffic</button>
+        </div>
+    </header>
+
+    <main>
+        <div class="metrics-grid">
+            <div class="card">
+                <div class="metric-label">Proxied Requests</div>
+                <div class="metric-value" id="m-proxied">0</div>
+            </div>
+            <div class="card">
+                <div class="metric-label">Upstream Errors</div>
+                <div class="metric-value" id="m-errors" style="color: var(--danger); text-shadow: 0 0 24px var(--danger-glow)">0</div>
+            </div>
+            <div class="card">
+                <div class="metric-label">Rate Limited</div>
+                <div class="metric-value" id="m-ratelimit" style="color: var(--warning)">0</div>
+            </div>
+            <div class="card">
+                <div class="metric-label">Active Config Reloads</div>
+                <div class="metric-value" id="m-reloads" style="color: var(--text-primary)">0</div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Upstream Health State</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Status</th>
+                        <th>Name</th>
+                        <th>URL</th>
+                        <th>Protocol</th>
+                        <th>Passive Fails</th>
+                    </tr>
+                </thead>
+                <tbody id="upstreams-body">
+                    <!-- Populated by JS -->
+                </tbody>
+            </table>
+        </div>
+
+        <div class="card">
+            <h2>Routing Table</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Host</th>
+                        <th>Path Prefix</th>
+                        <th>Upstream Pool</th>
+                        <th>Rate Limit (Req/s)</th>
+                    </tr>
+                </thead>
+                <tbody id="routes-body">
+                    <!-- Populated by JS -->
+                </tbody>
+            </table>
+        </div>
+    </main>
+
+    <div class="toast-container" id="toasts"></div>
+
+    <script>
+        function showToast(msg, isError = false) {
+            const container = document.getElementById('toasts');
+            const el = document.createElement('div');
+            el.className = 'toast';
+            el.style.borderLeft = `4px solid ${isError ? 'var(--danger)' : 'var(--accent)'}`;
+            el.innerText = msg;
+            container.appendChild(el);
+            setTimeout(() => el.classList.add('show'), 10);
+            setTimeout(() => {
+                el.classList.remove('show');
+                setTimeout(() => el.remove(), 400);
+            }, 4000);
+        }
+
+        function adminHeaders() {
+            let token = sessionStorage.getItem('yxorpAdminToken');
+            if (!token) {
+                token = prompt('Admin token') || '';
+                if (token) sessionStorage.setItem('yxorpAdminToken', token);
+            }
+            return token ? { 'Authorization': `Bearer ${token}` } : {};
+        }
+
+        async function fetchAdmin(path, options = {}) {
+            const headers = { ...(options.headers || {}), ...adminHeaders() };
+            let res = await fetch(path, { ...options, headers });
+            if (res.status === 401) {
+                sessionStorage.removeItem('yxorpAdminToken');
+                const retryHeaders = { ...(options.headers || {}), ...adminHeaders() };
+                res = await fetch(path, { ...options, headers: retryHeaders });
+            }
+            return res;
+        }
+
+        function appendTextCell(row, value, className) {
+            const td = document.createElement('td');
+            const span = document.createElement('span');
+            if (className) span.className = className;
+            span.textContent = String(value ?? '');
+            td.appendChild(span);
+            row.appendChild(td);
+            return td;
+        }
+
+        async function actionReload() {
+            try {
+                const res = await fetchAdmin('/reload', { method: 'POST' });
+                const json = await res.json();
+                if(res.ok) showToast("Configuration reloaded successfully");
+                else showToast(json.error || "Failed to reload", true);
+                fetchState();
+            } catch(e) { showToast(e.message, true); }
+        }
+
+        async function actionDrain() {
+            if(!confirm("Are you sure you want to drain traffic? This will stop accepting new connections.")) return;
+            try {
+                const res = await fetchAdmin('/drain', { method: 'POST' });
+                const json = await res.json();
+                if(res.ok) showToast("Server draining started");
+                else showToast(json.error || "Failed to drain", true);
+            } catch(e) { showToast(e.message, true); }
+        }
+
+        async function fetchState() {
+            try {
+                const res = await fetchAdmin('/api/state');
+                if (!res.ok) return;
+                const data = await res.json();
+                
+                // Render Upstreams
+                const uBody = document.getElementById('upstreams-body');
+                uBody.replaceChildren();
+                data.upstreams.forEach(u => {
+                    const healthy = u.active_healthy && u.passive_failures < 3; // assumption
+                    const dotClass = healthy ? 'status-healthy' : (u.active_healthy ? 'status-degraded' : 'status-dead');
+                    const tr = document.createElement('tr');
+                    const statusCell = document.createElement('td');
+                    const dot = document.createElement('div');
+                    dot.className = `status-dot ${dotClass}`;
+                    statusCell.appendChild(dot);
+                    tr.appendChild(statusCell);
+                    const nameCell = appendTextCell(tr, u.name);
+                    const strong = document.createElement('b');
+                    strong.textContent = nameCell.textContent;
+                    nameCell.replaceChildren(strong);
+                    appendTextCell(tr, u.url, 'code-pill');
+                    appendTextCell(tr, String(u.protocol || '').toUpperCase());
+                    const failures = appendTextCell(tr, u.passive_failures);
+                    failures.style.color = u.passive_failures > 0 ? 'var(--warning)' : 'inherit';
+                    uBody.appendChild(tr);
+                });
+
+                // Render Routes
+                const rBody = document.getElementById('routes-body');
+                rBody.replaceChildren();
+                data.routes.forEach(r => {
+                    const rl = r.rate_limit.enabled ? `${r.rate_limit.fill_rate} / ${r.rate_limit.capacity} burst` : 'Disabled';
+                    const tr = document.createElement('tr');
+                    appendTextCell(tr, r.host);
+                    appendTextCell(tr, r.path_prefix, 'code-pill');
+                    const poolCell = appendTextCell(tr, r.upstream_pool);
+                    const strong = document.createElement('b');
+                    strong.textContent = poolCell.textContent;
+                    poolCell.replaceChildren(strong);
+                    appendTextCell(tr, rl);
+                    rBody.appendChild(tr);
+                });
+            } catch (e) {
+                console.error("Failed to fetch state", e);
+            }
+        }
+
+        async function fetchMetrics() {
+            try {
+                const res = await fetchAdmin('/metrics');
+                if (!res.ok) return;
+                const text = await res.text();
+                
+                const parseMetric = (regex) => {
+                    const match = text.match(regex);
+                    return match ? parseInt(match[1]) : 0;
+                };
+
+                document.getElementById('m-proxied').innerText = parseMetric(/^yxorp_requests_total\{result="proxied"\} ([0-9]+)/m);
+                document.getElementById('m-errors').innerText = parseMetric(/^yxorp_requests_total\{result="upstream_error"\} ([0-9]+)/m);
+                document.getElementById('m-ratelimit').innerText = parseMetric(/^yxorp_requests_total\{result="rate_limited"\} ([0-9]+)/m);
+                document.getElementById('m-reloads').innerText = parseMetric(/^yxorp_reloads_total\{result="success"\} ([0-9]+)/m);
+            } catch (e) {
+                console.error("Failed to fetch metrics", e);
+            }
+        }
+
+        // Initial Load & Polling
+        fetchState();
+        fetchMetrics();
+        setInterval(fetchState, 5000);
+        setInterval(fetchMetrics, 2000);
+    </script>
+</body>
+</html>
