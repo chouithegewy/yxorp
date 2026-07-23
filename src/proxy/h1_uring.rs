@@ -8,6 +8,7 @@ use arc_swap::ArcSwap;
 use memchr::memmem;
 use tokio::net::TcpSocket;
 use tokio::sync::watch;
+use tokio_uring::buf::fixed::FixedBufPool;
 use tokio_uring::buf::BoundedBuf;
 use tokio_uring::net::{TcpListener as UringTcpListener, TcpStream as UringTcpStream};
 use tracing::{error, info, warn};
@@ -75,6 +76,40 @@ use std::os::fd::AsRawFd;
 
 thread_local! {
     static URING_POOL: RefCell<HashMap<SocketAddr, Vec<(UringTcpStream, Instant)>>> = RefCell::new(HashMap::new());
+}
+
+/// Number of buffers registered with each worker ring (× READ_CHUNK_BYTES).
+const FIXED_BUF_COUNT: usize = 64;
+
+thread_local! {
+    // Per-worker registered fixed buffer pool. `None` until first use; `disabled`
+    // latches on if registration fails (e.g. RLIMIT_MEMLOCK) so we fall back to
+    // ordinary heap buffers without retrying.
+    static FIXED_POOL: RefCell<Option<std::rc::Rc<FixedBufPool<Vec<u8>>>>> =
+        const { RefCell::new(None) };
+    static FIXED_POOL_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// This worker's registered fixed buffer pool, registering it on first use.
+/// Returns `None` when registration is unavailable so callers use heap buffers.
+fn fixed_pool() -> Option<std::rc::Rc<FixedBufPool<Vec<u8>>>> {
+    if FIXED_POOL_DISABLED.with(|d| d.get()) {
+        return None;
+    }
+    FIXED_POOL.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if guard.is_none() {
+            let pool =
+                FixedBufPool::new((0..FIXED_BUF_COUNT).map(|_| vec![0u8; READ_CHUNK_BYTES]));
+            if let Err(err) = pool.register() {
+                warn!(error = %err, "io_uring fixed buffer registration failed; using heap buffers");
+                FIXED_POOL_DISABLED.with(|d| d.set(true));
+                return None;
+            }
+            *guard = Some(std::rc::Rc::new(pool));
+        }
+        guard.clone()
+    })
 }
 
 fn checkout_uring_conn(addr: SocketAddr, idle_threshold: Duration) -> Option<UringTcpStream> {
@@ -235,6 +270,7 @@ async fn serve_connection(
     peer_addr: SocketAddr,
 ) -> Result<()> {
     let idle_threshold = snapshot.config.runtime.liveness_probe_idle();
+    let zero_copy = snapshot.config.runtime.zero_copy;
     let mut downstream_buf = Vec::with_capacity(READ_CHUNK_BYTES);
     let mut upstream_buf = Vec::with_capacity(READ_CHUNK_BYTES);
     let mut downstream_read_buf = Some(vec![0; READ_CHUNK_BYTES]);
@@ -327,6 +363,7 @@ async fn serve_connection(
                 &upstream_stream,
                 request.head.body_len,
                 downstream_read_buf,
+                zero_copy,
             ),
         )
         .await
@@ -377,6 +414,7 @@ async fn serve_connection(
                 &downstream,
                 response.body,
                 upstream_read_buf,
+                zero_copy,
             ),
         )
         .await
@@ -573,6 +611,7 @@ async fn copy_exact_body(
     dst: &UringTcpStream,
     mut remaining: usize,
     mut read_buf: Option<Vec<u8>>,
+    zero_copy: bool,
 ) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
     let buffered = src_buf.len().min(remaining);
     if buffered > 0 {
@@ -582,7 +621,26 @@ async fn copy_exact_body(
         discard_buffer_prefix(&mut src_buf, buffered);
         remaining -= buffered;
     }
+    // Registered fixed buffers: read_fixed/write_fixed_all avoid the per-op buffer
+    // mapping the kernel does for ordinary reads. Falls back to a heap buffer for
+    // any iteration where no registered buffer is free or registration is disabled.
+    let pool = if zero_copy { fixed_pool() } else { None };
     while remaining > 0 {
+        if let Some(pool) = &pool
+            && let Some(fbuf) = pool.try_next(READ_CHUNK_BYTES)
+        {
+            let want = READ_CHUNK_BYTES.min(remaining);
+            let (result, rslice) = src.read_fixed(fbuf.slice(..want)).await;
+            let read = result?;
+            if read == 0 {
+                return Err(UringError::Io(io::ErrorKind::UnexpectedEof.into()));
+            }
+            let fbuf = rslice.into_inner();
+            let (result, _) = dst.write_fixed_all(fbuf.slice(..read)).await;
+            result?;
+            remaining -= read;
+            continue;
+        }
         let mut active_buf = read_buf.take().unwrap_or_else(|| vec![0; READ_CHUNK_BYTES]);
         let limit = READ_CHUNK_BYTES.min(remaining);
         // Truncate to the read limit; tokio_uring reads up to buf.len() bytes.
@@ -609,11 +667,12 @@ async fn copy_response_body(
     dst: &UringTcpStream,
     body: ResponseBody,
     mut read_buf: Option<Vec<u8>>,
+    zero_copy: bool,
 ) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
     match body {
         ResponseBody::None => Ok((src_buf, read_buf)),
         ResponseBody::ContentLength(length) => {
-            copy_exact_body(src, src_buf, dst, length, read_buf).await
+            copy_exact_body(src, src_buf, dst, length, read_buf, zero_copy).await
         }
         ResponseBody::CloseDelimited => {
             if !src_buf.is_empty() {
@@ -812,6 +871,110 @@ mod tests {
             // under its own address key.
             assert!(checkout_uring_conn("127.0.0.1:1".parse().unwrap(), Duration::from_millis(250)).is_none());
             assert!(checkout_uring_conn(addr, Duration::from_millis(250)).is_some());
+        });
+    }
+
+    fn snapshot_for(upstream_addr: SocketAddr) -> ConfigSnapshot {
+        ConfigSnapshot::parse(
+            &format!(
+                r#"
+                [[routes]]
+                name = "root"
+                host = "*"
+                path_prefix = "/"
+                upstream_pool = "web"
+
+                [upstream_pools.web]
+                [[upstream_pools.web.upstreams]]
+                name = "web"
+                url = "http://{upstream_addr}"
+                protocol = "h1"
+                weight = 1
+                "#
+            ),
+            "inline",
+        )
+        .unwrap()
+    }
+
+    async fn read_until_headers(stream: &UringTcpStream) -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            let rb = vec![0u8; 4096];
+            let (res, rb) = stream.read(rb).await;
+            let n = res.unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&rb[..n]);
+            if memmem::find(&buf, b"\r\n\r\n").is_some() {
+                break;
+            }
+        }
+        buf
+    }
+
+    #[test]
+    fn uring_proxies_content_length_response_end_to_end() {
+        // Exercises the registered fixed-buffer body path end to end. Skips where
+        // io_uring is unavailable (sandboxed CI).
+        if preflight_io_uring().is_err() {
+            return;
+        }
+        tokio_uring::start(async {
+            let body = vec![7u8; 100_000];
+
+            // Upstream: reply with a fixed Content-Length body, then stay open.
+            let upstream = UringTcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let up_addr = upstream.local_addr().unwrap();
+            let up_body = body.clone();
+            tokio_uring::spawn(async move {
+                let (stream, _) = upstream.accept().await.unwrap();
+                let _ = read_until_headers(&stream).await;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                    up_body.len()
+                );
+                let (r, _) = stream.write_all(header.into_bytes()).await;
+                r.unwrap();
+                let (r, _) = stream.write_all(up_body).await;
+                r.unwrap();
+                std::future::pending::<()>().await;
+            });
+
+            // Proxy front listener.
+            let front = UringTcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let front_addr = front.local_addr().unwrap();
+            let snapshot = Arc::new(snapshot_for(up_addr));
+            tokio_uring::spawn(async move {
+                let (stream, peer) = front.accept().await.unwrap();
+                let _ = serve_connection(snapshot, stream, peer).await;
+            });
+
+            // Client.
+            let client = UringTcpStream::connect(front_addr).await.unwrap();
+            let (r, _) = client
+                .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n".to_vec())
+                .await;
+            r.unwrap();
+
+            let mut got: Vec<u8> = Vec::new();
+            loop {
+                let rb = vec![0u8; 16384];
+                let (res, rb) = client.read(rb).await;
+                let n = res.unwrap();
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&rb[..n]);
+                if let Some(i) = memmem::find(&got, b"\r\n\r\n")
+                    && got.len() - (i + 4) >= body.len()
+                {
+                    break;
+                }
+            }
+            let idx = memmem::find(&got, b"\r\n\r\n").unwrap() + 4;
+            assert_eq!(&got[idx..idx + body.len()], &body[..]);
         });
     }
 
