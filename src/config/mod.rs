@@ -732,12 +732,16 @@ impl Default for TelemetryConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeConfig {
     pub drain_timeout_ms: u64,
+    pub zero_copy: bool,
+    pub liveness_probe_idle_ms: u64,
 }
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             drain_timeout_ms: 30_000,
+            zero_copy: true,
+            liveness_probe_idle_ms: 250,
         }
     }
 }
@@ -745,6 +749,10 @@ impl Default for RuntimeConfig {
 impl RuntimeConfig {
     pub fn drain_timeout(&self) -> Duration {
         Duration::from_millis(self.drain_timeout_ms)
+    }
+
+    pub fn liveness_probe_idle(&self) -> Duration {
+        Duration::from_millis(self.liveness_probe_idle_ms)
     }
 }
 
@@ -1150,6 +1158,32 @@ fn resolve_socket_addr(authority: &str) -> std::io::Result<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_defaults_enable_zero_copy() {
+        let cfg = RuntimeConfig::default();
+        assert!(cfg.zero_copy);
+        assert_eq!(cfg.liveness_probe_idle_ms, 250);
+        assert_eq!(cfg.liveness_probe_idle().as_millis(), 250);
+    }
+
+    #[test]
+    fn runtime_omitted_fields_use_defaults() {
+        // A config with no [runtime] table must still parse and default zero_copy on.
+        let toml = r#"
+            [[routes]]
+            name = "r"
+            host = "*"
+            path_prefix = "/"
+            upstream_pool = "web"
+            [upstream_pools.web]
+            [[upstream_pools.web.upstreams]]
+            name = "a"
+            url = "http://127.0.0.1:9000"
+        "#;
+        let snap = ConfigSnapshot::parse(toml, "inline").unwrap();
+        assert!(snap.config.runtime.zero_copy);
+    }
 
     fn sample() -> &'static str {
         r#"
