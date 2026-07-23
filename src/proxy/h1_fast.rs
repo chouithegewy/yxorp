@@ -469,13 +469,35 @@ async fn read_and_forward_response(
             .await?
             .ok_or(FastH1Error::Parse("upstream closed before response"))?;
         let response = parse_response(&upstream_buf[..header_end], head_response)?;
-        downstream.write_all(&upstream_buf[..header_end]).await?;
-        discard_buffer_prefix(upstream_buf, header_end);
         if (100..200).contains(&response.status) {
+            // 1xx interim response: forward the header, flush, keep reading for
+            // the final status line.
+            downstream.write_all(&upstream_buf[..header_end]).await?;
+            discard_buffer_prefix(upstream_buf, header_end);
             downstream.flush().await?;
             continue;
         }
-        copy_body(upstream, upstream_buf, downstream, response.body, None).await?;
+
+        // Coalesce the response header with any already-buffered leading body
+        // bytes into a single write, so a small response leaves the proxy as one
+        // send() / one segment instead of a header packet followed by a body
+        // packet under TCP_NODELAY.
+        let buffered_body = upstream_buf.len() - header_end;
+        let coalesced = match response.body {
+            BodyKind::ContentLength(length) => header_end + buffered_body.min(length),
+            _ => header_end,
+        };
+        downstream.write_all(&upstream_buf[..coalesced]).await?;
+        discard_buffer_prefix(upstream_buf, coalesced);
+
+        match response.body {
+            BodyKind::ContentLength(length) => {
+                // Bytes of the body already sent as part of the coalesced write.
+                let already_sent = coalesced - header_end;
+                copy_exact_body(upstream, upstream_buf, downstream, length - already_sent).await?;
+            }
+            _ => copy_body(upstream, upstream_buf, downstream, response.body, None).await?,
+        }
         downstream.flush().await?;
         return Ok(response);
     }
@@ -935,6 +957,46 @@ mod tests {
             "inline",
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn proxies_large_content_length_response_byte_for_byte() {
+        // Exercises the coalesced header+buffered-body write and the remainder
+        // read path for a body larger than one read chunk.
+        let body: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let server_body = body.clone();
+        tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let _ = read_header_block(&mut stream, &mut buf).await.unwrap().unwrap();
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                server_body.len()
+            );
+            stream.write_all(header.as_bytes()).await.unwrap();
+            stream.write_all(&server_body).await.unwrap();
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let snapshot = Arc::new(fast_snapshot(upstream_addr));
+        let pool = Arc::new(FastConnectionPool::new());
+        tokio::spawn(async move {
+            let (stream, _) = proxy.accept().await.unwrap();
+            let _ = serve_connection(snapshot, pool, stream).await;
+        });
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        client
+            .write_all(b"GET /large HTTP/1.1\r\nHost: example.test\r\n\r\n")
+            .await
+            .unwrap();
+        assert_eq!(read_client_body(&mut client).await, body);
     }
 
     #[tokio::test]
