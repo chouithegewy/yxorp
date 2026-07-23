@@ -2,7 +2,7 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use memchr::memmem;
@@ -74,15 +74,17 @@ use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 
 thread_local! {
-    static URING_POOL: RefCell<HashMap<SocketAddr, Vec<UringTcpStream>>> = RefCell::new(HashMap::new());
+    static URING_POOL: RefCell<HashMap<SocketAddr, Vec<(UringTcpStream, Instant)>>> = RefCell::new(HashMap::new());
 }
 
-fn checkout_uring_conn(addr: SocketAddr) -> Option<UringTcpStream> {
+fn checkout_uring_conn(addr: SocketAddr, idle_threshold: Duration) -> Option<UringTcpStream> {
     URING_POOL.with(|pool| {
         let mut guard = pool.borrow_mut();
         if let Some(conns) = guard.get_mut(&addr) {
-            while let Some(conn) = conns.pop() {
-                if is_uring_conn_alive(&conn) {
+            while let Some((conn, idle_since)) = conns.pop() {
+                // Hot keepalive reuse (idle under the threshold) skips the
+                // recv(MSG_PEEK) probe; only longer-idle connections are checked.
+                if idle_since.elapsed() < idle_threshold || is_uring_conn_alive(&conn) {
                     return Some(conn);
                 }
             }
@@ -94,7 +96,7 @@ fn checkout_uring_conn(addr: SocketAddr) -> Option<UringTcpStream> {
 fn checkin_uring_conn(addr: SocketAddr, conn: UringTcpStream) {
     URING_POOL.with(|pool| {
         let mut guard = pool.borrow_mut();
-        guard.entry(addr).or_default().push(conn);
+        guard.entry(addr).or_default().push((conn, Instant::now()));
     });
 }
 
@@ -122,8 +124,9 @@ fn is_uring_conn_alive(stream: &UringTcpStream) -> bool {
 async fn get_uring_connection(
     addr: SocketAddr,
     connect_timeout: Duration,
+    idle_threshold: Duration,
 ) -> std::io::Result<UringTcpStream> {
-    if let Some(stream) = checkout_uring_conn(addr) {
+    if let Some(stream) = checkout_uring_conn(addr, idle_threshold) {
         return Ok(stream);
     }
     let stream = tokio::time::timeout(connect_timeout, UringTcpStream::connect(addr))
@@ -231,6 +234,7 @@ async fn serve_connection(
     downstream: UringTcpStream,
     peer_addr: SocketAddr,
 ) -> Result<()> {
+    let idle_threshold = snapshot.config.runtime.liveness_probe_idle();
     let mut downstream_buf = Vec::with_capacity(READ_CHUNK_BYTES);
     let mut upstream_buf = Vec::with_capacity(READ_CHUNK_BYTES);
     let mut downstream_read_buf = Some(vec![0; READ_CHUNK_BYTES]);
@@ -288,6 +292,7 @@ async fn serve_connection(
         let upstream_stream = match get_uring_connection(
             request.upstream.connect_addr,
             request.upstream.connect_timeout,
+            idle_threshold,
         )
         .await
         {
@@ -785,6 +790,30 @@ fn set_reuseport(_socket: &TcpSocket) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uring_pool_idle_gating_returns_fresh_checkin() {
+        // io_uring may be unavailable in sandboxed CI; skip gracefully there.
+        if preflight_io_uring().is_err() {
+            return;
+        }
+        tokio_uring::start(async {
+            let listener =
+                UringTcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = listener.local_addr().unwrap();
+            // Keep the accepted peer alive for the duration of the test.
+            tokio_uring::spawn(async move {
+                let _accepted = listener.accept().await;
+                std::future::pending::<()>().await;
+            });
+            let conn = UringTcpStream::connect(addr).await.unwrap();
+            checkin_uring_conn(addr, conn);
+            // Reused within the idle threshold: returned without probing, and only
+            // under its own address key.
+            assert!(checkout_uring_conn("127.0.0.1:1".parse().unwrap(), Duration::from_millis(250)).is_none());
+            assert!(checkout_uring_conn(addr, Duration::from_millis(250)).is_some());
+        });
+    }
 
     fn snapshot() -> ConfigSnapshot {
         ConfigSnapshot::parse(
