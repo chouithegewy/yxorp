@@ -24,7 +24,10 @@ pub mod slab;
 pub mod timer;
 
 pub use buf::{IoBuf, IoBufMut};
-pub use executor::{block_on, in_flight, is_runtime_available, spawn_local, JoinHandle};
+pub use executor::{
+    block_on, current_ring_fd, in_flight, is_runtime_available, post_message, recv_message,
+    spawn_local, JoinHandle,
+};
 pub use net::{TcpListener, TcpStream};
 pub use shard::{num_cpus, spawn_shards};
 pub use timer::{sleep, timeout, Elapsed, Sleep};

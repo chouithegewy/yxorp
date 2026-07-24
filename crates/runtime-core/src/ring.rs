@@ -5,7 +5,9 @@
 //! and completion goes through here; the executor batches SQEs prepared by many
 //! futures into a single `io_uring_enter`.
 
+use std::collections::VecDeque;
 use std::io;
+use std::task::Waker;
 use std::time::Duration;
 
 use runtime_uring_sys::ffi;
@@ -14,6 +16,11 @@ use runtime_uring_sys::KernelCaps;
 
 use crate::op::{CqeResult, Op, OpState};
 use crate::slab::{OpKey, OpSlab};
+
+/// Top `user_data` bit, set on `MSG_RING`-delivered completions to distinguish a
+/// cross-shard message from an op completion. Our [`OpKey`]s pack a small slot index
+/// into bits 32..63, so bit 63 is always clear for them.
+const MSG_TAG: u64 = 1 << 63;
 
 /// Default submission-queue depth. The completion queue is sized larger (multishot /
 /// zero-copy notifications in later phases can produce more CQEs than SQEs).
@@ -29,6 +36,9 @@ pub struct Ring {
     ops: OpSlab<Op>,
     caps: KernelCaps,
     fixed_files: bool,
+    /// Cross-shard messages delivered to this ring via `MSG_RING`, awaiting a receiver.
+    inbox: VecDeque<u64>,
+    inbox_waker: Option<Waker>,
 }
 
 impl Ring {
@@ -79,6 +89,8 @@ impl Ring {
                     ops: OpSlab::with_capacity(SQ_ENTRIES as usize),
                     caps,
                     fixed_files,
+                    inbox: VecDeque::new(),
+                    inbox_waker: None,
                 });
             }
             if flags == 0 {
@@ -100,6 +112,34 @@ impl Ring {
     /// The underlying io_uring fd, used as the target of an `MSG_RING` from a peer shard.
     pub(crate) fn ring_fd(&self) -> i32 {
         self.ring.ring_fd
+    }
+
+    /// Post a `payload` message to a peer ring identified by `target_fd` (its
+    /// `ring_fd`). Queued on this ring; delivered to the peer's CQ as a tagged
+    /// completion. Fire-and-forget: this ring's completion for the op is untracked.
+    pub(crate) fn post_msg(&mut self, target_fd: i32, payload: u64) -> io::Result<()> {
+        let sqe = self.next_sqe()?;
+        unsafe {
+            inline::io_uring_prep_msg_ring(sqe, target_fd, 0, MSG_TAG | (payload & !MSG_TAG), 0);
+            inline::io_uring_sqe_set_data64(sqe, 0);
+        }
+        Ok(())
+    }
+
+    /// Pop the next delivered cross-shard message, or park `waker` if none yet.
+    pub(crate) fn poll_message(&mut self, waker: &Waker) -> Option<u64> {
+        if let Some(payload) = self.inbox.pop_front() {
+            Some(payload)
+        } else {
+            self.inbox_waker = Some(waker.clone());
+            None
+        }
+    }
+
+    /// Whether a receiver is currently parked waiting for a cross-shard message (a
+    /// legitimate reason for the executor to block on the ring).
+    pub(crate) fn has_inbox_waiter(&self) -> bool {
+        self.inbox_waker.is_some()
     }
 
     /// Number of operations currently in flight (submitted or awaiting drain).
@@ -292,6 +332,15 @@ impl Ring {
             };
             count += 1;
             if data == 0 {
+                continue;
+            }
+            if data & MSG_TAG != 0 {
+                // Cross-shard message from a peer ring (res carries the length field,
+                // unused here). Deliver to the inbox and wake any receiver.
+                self.inbox.push_back(data & !MSG_TAG);
+                if let Some(waker) = self.inbox_waker.take() {
+                    waker.wake();
+                }
                 continue;
             }
             let key = OpKey::from_u64(data);

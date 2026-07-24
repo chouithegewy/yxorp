@@ -167,9 +167,10 @@ where
         }
         let inflight = runtime.ring.borrow().in_flight();
         let has_timers = !runtime.timers.borrow().is_empty();
+        let awaiting_msg = runtime.ring.borrow().has_inbox_waiter();
         assert!(
-            inflight > 0 || has_timers,
-            "runtime stalled: root task parked with no pending io or timers"
+            inflight > 0 || has_timers || awaiting_msg,
+            "runtime stalled: root task parked with no pending io, timers, or message wait"
         );
         runtime
             .drive_io()
@@ -225,6 +226,28 @@ pub(crate) fn with_timers<R>(f: impl FnOnce(&mut TimerWheel) -> R) -> R {
 /// by tests to assert orphaned ops are reaped.
 pub fn in_flight() -> usize {
     with_ring(|ring| ring.in_flight())
+}
+
+/// This shard's io_uring fd — the target other shards pass to [`post_message`].
+pub fn current_ring_fd() -> i32 {
+    with_ring(|ring| ring.ring_fd())
+}
+
+/// Post a `payload` to a peer shard's ring (identified by its [`current_ring_fd`]) via
+/// `MSG_RING`. Delivered to the peer as a cross-shard message; see [`recv_message`].
+pub fn post_message(target_ring_fd: i32, payload: u64) {
+    with_ring(|ring| {
+        let _ = ring.post_msg(target_ring_fd, payload);
+    });
+}
+
+/// Await the next cross-shard message delivered to this shard.
+pub async fn recv_message() -> u64 {
+    std::future::poll_fn(|cx| match with_ring(|ring| ring.poll_message(cx.waker())) {
+        Some(payload) => Poll::Ready(payload),
+        None => Poll::Pending,
+    })
+    .await
 }
 
 fn with_current<R>(f: impl FnOnce(&Runtime) -> R) -> R {
