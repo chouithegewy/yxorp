@@ -1,3 +1,10 @@
+[workspace]
+# The root `yxorp` package is implicitly a member; the completion-native io_uring
+# runtime lives in dedicated crates so it can grow (and be tested) independently of
+# the proxy. See docs/uring_migration_analysis.md.
+members = ["crates/runtime-uring-sys", "crates/runtime-core"]
+resolver = "3"
+
 [package]
 name = "yxorp"
 version = "0.1.0"

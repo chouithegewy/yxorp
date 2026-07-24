@@ -1,0 +1,15 @@
+[package]
+name = "runtime-uring-sys"
+version = "0.1.0"
+edition = "2024"
+description = "Unsafe FFI + control-plane bindings to vendored liburing 2.15 for the yxorp completion-native runtime."
+publish = false
+# Declares the native library this crate links, so Cargo serialises linking and
+# lets downstream build scripts read our `DEP_URING_FFI_*` metadata if needed.
+links = "uring_ffi"
+
+[dependencies]
+libc = "0.2.186"
+
+[build-dependencies]
+bindgen = "0.72"

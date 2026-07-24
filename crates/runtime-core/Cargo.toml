@@ -1,0 +1,10 @@
+[package]
+name = "runtime-core"
+version = "0.1.0"
+edition = "2024"
+description = "Completion-native single-thread io_uring executor: generational op-slab, owned-buffer I/O, timers, cancellation-safe futures, deterministic shutdown."
+publish = false
+
+[dependencies]
+runtime-uring-sys = { path = "../runtime-uring-sys" }
+libc = "0.2.186"

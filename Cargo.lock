@@ -321,6 +321,8 @@ dependencies = [
  "cexpr",
  "clang-sys",
  "itertools 0.13.0",
+ "log",
+ "prettyplease",
  "proc-macro2",
  "quote",
  "regex",
@@ -2828,6 +2830,22 @@ dependencies = [
  "libc",
  "untrusted 0.9.0",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "runtime-core"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "runtime-uring-sys",
+]
+
+[[package]]
+name = "runtime-uring-sys"
+version = "0.1.0"
+dependencies = [
+ "bindgen",
+ "libc",
 ]
 
 [[package]]
