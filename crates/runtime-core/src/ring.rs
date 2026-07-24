@@ -322,6 +322,18 @@ impl Ring {
         count
     }
 
+    /// Fire-and-forget close of a direct (fixed) descriptor, used when a fixed-fd
+    /// stream is dropped without an explicit async close. The freed slot returns to
+    /// the table once the kernel processes it.
+    pub(crate) fn close_direct_detached(&mut self, index: u32) {
+        if let Ok(sqe) = self.next_sqe() {
+            unsafe {
+                inline::io_uring_prep_close_direct(sqe, index);
+                inline::io_uring_sqe_set_data64(sqe, 0);
+            }
+        }
+    }
+
     /// Queue a request that cancels every outstanding operation (untracked).
     fn cancel_all(&mut self) {
         if let Ok(sqe) = self.next_sqe() {

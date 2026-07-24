@@ -1,10 +1,12 @@
 //! Owned-buffer TCP primitives over the completion runtime.
 //!
-//! Socket creation / bind / listen are one-time synchronous `libc` calls (matching
-//! the existing `bind_listener_socket`); accept, connect, recv, send, and close are
-//! io_uring operations. All data-path buffers are **owned**: they move into the op
-//! and are handed back on completion (`(result, buffer)`), so a dropped future can
-//! orphan the buffer safely rather than free it under the kernel.
+//! Socket bind/listen are one-time synchronous `libc` calls; accept, connect, recv,
+//! send, and close are io_uring operations. When the ring has a registered fixed-file
+//! table (Phase 2), accepted and outbound sockets are **direct descriptors** — the
+//! kernel installs them into the fixed table and ops reference them by index with
+//! `IOSQE_FIXED_FILE`, skipping the per-op `fget`/`fput`. The runtime falls back to
+//! raw fds where fixed files are unavailable. Data buffers are always owned: they move
+//! into the op and are handed back on completion.
 
 use std::future::Future;
 use std::io;
@@ -19,7 +21,33 @@ use runtime_uring_sys::inline;
 
 use crate::buf::IoBufMut;
 use crate::executor::with_ring;
+use crate::fut::OpFuture;
 use crate::slab::OpKey;
+
+/// A connected socket: either a raw process fd or a direct (fixed-table) descriptor.
+#[derive(Clone, Copy)]
+enum Fd {
+    Raw(RawFd),
+    Fixed(u32),
+}
+
+impl Fd {
+    /// Prepare an SQE's fd field for this descriptor, setting `IOSQE_FIXED_FILE` when
+    /// it is a direct descriptor. Call BEFORE stamping user_data, AFTER the `prep_*`
+    /// helper (which zeroes flags).
+    fn set_fixed_flag(self, sqe: *mut runtime_uring_sys::ffi::io_uring_sqe) {
+        if let Fd::Fixed(_) = self {
+            unsafe { inline::io_uring_sqe_set_flags(sqe, inline::IOSQE_FIXED_FILE) };
+        }
+    }
+
+    fn arg(self) -> c_int {
+        match self {
+            Fd::Raw(fd) => fd,
+            Fd::Fixed(index) => index as c_int,
+        }
+    }
+}
 
 // ---- address helpers ------------------------------------------------------------
 
@@ -89,6 +117,45 @@ fn new_socket(addr: &SocketAddr) -> io::Result<RawFd> {
     }
 }
 
+fn set_reuseaddr(fd: RawFd) {
+    let one: c_int = 1;
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            &one as *const _ as *const c_void,
+            mem::size_of::<c_int>() as libc::socklen_t,
+        );
+    }
+}
+
+fn set_reuseport(fd: RawFd) {
+    let one: c_int = 1;
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEPORT,
+            &one as *const _ as *const c_void,
+            mem::size_of::<c_int>() as libc::socklen_t,
+        );
+    }
+}
+
+fn bind_listen(fd: RawFd, addr: &SocketAddr) -> io::Result<()> {
+    let (storage, len) = to_sockaddr(addr);
+    unsafe {
+        if libc::bind(fd, &storage as *const _ as *const libc::sockaddr, len) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if libc::listen(fd, 1024) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 fn getsockname(fd: RawFd) -> io::Result<SocketAddr> {
     unsafe {
         let mut storage: libc::sockaddr_storage = mem::zeroed();
@@ -107,29 +174,26 @@ pub struct TcpListener {
 }
 
 impl TcpListener {
-    /// Bind + listen synchronously (one-time), enabling `SO_REUSEADDR`.
+    /// Bind + listen with `SO_REUSEADDR`.
     pub fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
+        Self::bind_inner(addr, false)
+    }
+
+    /// Bind + listen with `SO_REUSEPORT` so multiple shards can each own a listener on
+    /// the same address and the kernel load-balances incoming connections.
+    pub fn bind_reuseport(addr: SocketAddr) -> io::Result<TcpListener> {
+        Self::bind_inner(addr, true)
+    }
+
+    fn bind_inner(addr: SocketAddr, reuseport: bool) -> io::Result<TcpListener> {
         let fd = new_socket(&addr)?;
-        unsafe {
-            let one: c_int = 1;
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_REUSEADDR,
-                &one as *const _ as *const c_void,
-                mem::size_of::<c_int>() as libc::socklen_t,
-            );
-            let (storage, len) = to_sockaddr(&addr);
-            if libc::bind(fd, &storage as *const _ as *const libc::sockaddr, len) < 0 {
-                let err = io::Error::last_os_error();
-                libc::close(fd);
-                return Err(err);
-            }
-            if libc::listen(fd, 1024) < 0 {
-                let err = io::Error::last_os_error();
-                libc::close(fd);
-                return Err(err);
-            }
+        set_reuseaddr(fd);
+        if reuseport {
+            set_reuseport(fd);
+        }
+        if let Err(err) = bind_listen(fd, &addr) {
+            unsafe { libc::close(fd) };
+            return Err(err);
         }
         Ok(TcpListener { fd })
     }
@@ -138,7 +202,7 @@ impl TcpListener {
         getsockname(self.fd)
     }
 
-    /// Accept one connection via io_uring, returning the stream and peer address.
+    /// Accept one connection. Uses direct-descriptor accept when the ring supports it.
     pub fn accept(&self) -> AcceptFut {
         AcceptFut {
             fd: self.fd,
@@ -146,6 +210,7 @@ impl TcpListener {
                 storage: unsafe { mem::zeroed() },
                 len: mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
             })),
+            direct: with_ring(|ring| ring.has_fixed_files()),
             key: None,
             done: false,
         }
@@ -166,6 +231,7 @@ struct AcceptSlot {
 pub struct AcceptFut {
     fd: RawFd,
     slot: Option<Box<AcceptSlot>>,
+    direct: bool,
     key: Option<OpKey>,
     done: bool,
 }
@@ -189,9 +255,16 @@ impl Future for AcceptFut {
                     if result.res < 0 {
                         Poll::Ready(Err(io::Error::from_raw_os_error(-result.res)))
                     } else {
+                        // Direct accept returns the allocated fixed index in res; plain
+                        // accept returns a raw fd. Both populate the peer sockaddr.
+                        let fd = if this.direct {
+                            Fd::Fixed(result.res as u32)
+                        } else {
+                            Fd::Raw(result.res)
+                        };
                         let peer = from_sockaddr(&slot.storage)
                             .ok_or_else(|| io::Error::other("unknown peer address family"));
-                        Poll::Ready(peer.map(|peer| (TcpStream { fd: result.res }, peer)))
+                        Poll::Ready(peer.map(|peer| (TcpStream { fd }, peer)))
                     }
                 }
                 None => Poll::Pending,
@@ -200,11 +273,23 @@ impl Future for AcceptFut {
 
         let mut slot = this.slot.take().expect("accept slot present");
         let fd = this.fd;
+        let direct = this.direct;
         let addr_ptr = &mut slot.storage as *mut _ as *mut libc::sockaddr;
         let len_ptr = &mut slot.len as *mut libc::socklen_t;
         let key = with_ring(|ring| {
             ring.submit_op(Some(slot as Box<dyn std::any::Any>), move |sqe| unsafe {
-                inline::io_uring_prep_accept(sqe, fd, addr_ptr, len_ptr, libc::SOCK_CLOEXEC);
+                if direct {
+                    inline::io_uring_prep_accept_direct(
+                        sqe,
+                        fd,
+                        addr_ptr,
+                        len_ptr,
+                        0,
+                        inline::FILE_INDEX_ALLOC,
+                    );
+                } else {
+                    inline::io_uring_prep_accept(sqe, fd, addr_ptr, len_ptr, libc::SOCK_CLOEXEC);
+                }
             })
         });
         match key {
@@ -226,13 +311,31 @@ impl Future for AcceptFut {
 // ---- stream ---------------------------------------------------------------------
 
 pub struct TcpStream {
-    fd: RawFd,
+    fd: Fd,
 }
 
 impl TcpStream {
-    /// Connect to `addr` via io_uring.
+    /// Connect to `addr`. Uses a direct (fixed) socket when the ring supports it.
     pub async fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
-        let fd = new_socket(&addr)?;
+        if with_ring(|ring| ring.has_fixed_files()) {
+            Self::connect_direct(addr).await
+        } else {
+            Self::connect_raw(addr).await
+        }
+    }
+
+    async fn connect_direct(addr: SocketAddr) -> io::Result<TcpStream> {
+        let domain = match addr {
+            SocketAddr::V4(_) => libc::AF_INET,
+            SocketAddr::V6(_) => libc::AF_INET6,
+        };
+        // Allocate a direct socket; the fixed index comes back in res.
+        let index = OpFuture::new(None, move |sqe| unsafe {
+            inline::io_uring_prep_socket_direct_alloc(sqe, domain, libc::SOCK_STREAM, 0, 0);
+        })
+        .await? as u32;
+        let fd = Fd::Fixed(index);
+
         let (storage, len) = to_sockaddr(&addr);
         let result = ConnectFut {
             fd,
@@ -244,29 +347,52 @@ impl TcpStream {
         match result {
             Ok(()) => Ok(TcpStream { fd }),
             Err(err) => {
-                unsafe { libc::close(fd) };
+                with_ring(|ring| ring.close_direct_detached(index));
                 Err(err)
             }
         }
     }
 
-    pub fn as_raw_fd(&self) -> RawFd {
-        self.fd
+    async fn connect_raw(addr: SocketAddr) -> io::Result<TcpStream> {
+        let raw = new_socket(&addr)?;
+        let fd = Fd::Raw(raw);
+        let (storage, len) = to_sockaddr(&addr);
+        let result = ConnectFut {
+            fd,
+            slot: Some(Box::new(ConnectSlot { storage, len })),
+            key: None,
+            done: false,
+        }
+        .await;
+        match result {
+            Ok(()) => Ok(TcpStream { fd }),
+            Err(err) => {
+                unsafe { libc::close(raw) };
+                Err(err)
+            }
+        }
     }
 
-    /// Receive into an owned buffer, returning the byte count (0 = EOF) and the buffer
-    /// (its length set to the bytes read).
+    /// The raw fd, if this stream is backed by one (not a direct descriptor).
+    pub fn as_raw_fd(&self) -> Option<RawFd> {
+        match self.fd {
+            Fd::Raw(fd) => Some(fd),
+            Fd::Fixed(_) => None,
+        }
+    }
+
+    /// Receive into an owned buffer; returns the byte count (0 = EOF) and the buffer
+    /// with its length set to the bytes read.
     pub fn recv<B: IoBufMut>(&self, buf: B) -> BufFut<B> {
         BufFut::new(self.fd, Dir::Recv, 0, buf)
     }
 
-    /// Send from an owned buffer's initialized bytes, returning bytes sent and the
-    /// buffer. May be a partial send; see [`TcpStream::send_all`].
+    /// Send an owned buffer's initialized bytes (may be partial; see [`send_all`]).
     pub fn send<B: IoBufMut>(&self, buf: B) -> BufFut<B> {
         BufFut::new(self.fd, Dir::Send, 0, buf)
     }
 
-    /// Send every initialized byte, looping over partial sends. Returns the buffer.
+    /// Send every initialized byte, looping over partial sends.
     pub async fn send_all<B: IoBufMut>(&self, buf: B) -> (io::Result<()>, B) {
         let total = crate::buf::IoBuf::bytes_init(&buf);
         let mut buf = buf;
@@ -287,8 +413,11 @@ impl TcpStream {
     pub async fn close(self) -> io::Result<()> {
         let fd = self.fd;
         mem::forget(self);
-        crate::fut::OpFuture::new(None, move |sqe| unsafe {
-            inline::io_uring_prep_close(sqe, fd);
+        OpFuture::new(None, move |sqe| unsafe {
+            match fd {
+                Fd::Raw(raw) => inline::io_uring_prep_close(sqe, raw),
+                Fd::Fixed(index) => inline::io_uring_prep_close_direct(sqe, index),
+            }
         })
         .await
         .map(|_| ())
@@ -297,7 +426,14 @@ impl TcpStream {
 
 impl Drop for TcpStream {
     fn drop(&mut self) {
-        unsafe { libc::close(self.fd) };
+        match self.fd {
+            Fd::Raw(fd) => unsafe {
+                libc::close(fd);
+            },
+            // A fixed descriptor is a table slot, not a process fd: free it via a
+            // fire-and-forget direct close on the ring.
+            Fd::Fixed(index) => with_ring(|ring| ring.close_direct_detached(index)),
+        }
     }
 }
 
@@ -307,7 +443,7 @@ struct ConnectSlot {
 }
 
 struct ConnectFut {
-    fd: RawFd,
+    fd: Fd,
     slot: Option<Box<ConnectSlot>>,
     key: Option<OpKey>,
     done: bool,
@@ -341,7 +477,8 @@ impl Future for ConnectFut {
         let len = slot.len;
         let key = with_ring(|ring| {
             ring.submit_op(Some(slot as Box<dyn std::any::Any>), move |sqe| unsafe {
-                inline::io_uring_prep_connect(sqe, fd, addr_ptr, len);
+                inline::io_uring_prep_connect(sqe, fd.arg(), addr_ptr, len);
+                fd.set_fixed_flag(sqe);
             })
         });
         match key {
@@ -367,10 +504,9 @@ enum Dir {
     Send,
 }
 
-/// A single recv or send over an owned buffer. The buffer moves into the op after a
-/// successful submit and is returned on completion (or on submit error).
+/// A single recv or send over an owned buffer.
 pub struct BufFut<B: IoBufMut> {
-    fd: RawFd,
+    fd: Fd,
     dir: Dir,
     off: usize,
     buf: Option<B>,
@@ -379,7 +515,7 @@ pub struct BufFut<B: IoBufMut> {
 }
 
 impl<B: IoBufMut> BufFut<B> {
-    fn new(fd: RawFd, dir: Dir, off: usize, buf: B) -> Self {
+    fn new(fd: Fd, dir: Dir, off: usize, buf: B) -> Self {
         BufFut {
             fd,
             dir,
@@ -430,7 +566,8 @@ impl<B: IoBufMut> Future for BufFut<B> {
                 let len = buf.bytes_total();
                 with_ring(|ring| {
                     ring.submit_op(None, move |sqe| unsafe {
-                        inline::io_uring_prep_recv(sqe, fd, ptr as *mut c_void, len, 0);
+                        inline::io_uring_prep_recv(sqe, fd.arg(), ptr as *mut c_void, len, 0);
+                        fd.set_fixed_flag(sqe);
                     })
                 })
             }
@@ -442,7 +579,8 @@ impl<B: IoBufMut> Future for BufFut<B> {
                 let ptr = unsafe { base.add(off) };
                 with_ring(|ring| {
                     ring.submit_op(None, move |sqe| unsafe {
-                        inline::io_uring_prep_send(sqe, fd, ptr as *const c_void, len, 0);
+                        inline::io_uring_prep_send(sqe, fd.arg(), ptr as *const c_void, len, 0);
+                        fd.set_fixed_flag(sqe);
                     })
                 })
             }

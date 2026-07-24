@@ -35,6 +35,24 @@ fn loopback_echo_roundtrips() {
 }
 
 #[test]
+fn accept_reports_loopback_peer() {
+    if !is_runtime_available() {
+        return;
+    }
+    block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = spawn_local(async move {
+            let (_stream, peer) = listener.accept().await.unwrap();
+            peer
+        });
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let peer = server.await;
+        assert!(peer.ip().is_loopback(), "expected loopback peer, got {peer}");
+    });
+}
+
+#[test]
 fn connect_to_dead_port_errors() {
     if !is_runtime_available() {
         return;
