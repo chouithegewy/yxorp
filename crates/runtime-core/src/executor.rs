@@ -194,6 +194,22 @@ pub(crate) fn with_ring<R>(f: impl FnOnce(&mut Ring) -> R) -> R {
     })
 }
 
+/// Borrow the current runtime's timer wheel. Panics if called outside [`block_on`].
+pub(crate) fn with_timers<R>(f: impl FnOnce(&mut TimerWheel) -> R) -> R {
+    CURRENT.with(|cell| {
+        let runtime = cell.borrow();
+        let runtime = runtime.as_ref().expect("no runtime on this thread");
+        let mut timers = runtime.timers.borrow_mut();
+        f(&mut timers)
+    })
+}
+
+/// Number of operations currently in flight on the current runtime. Diagnostic; used
+/// by tests to assert orphaned ops are reaped.
+pub fn in_flight() -> usize {
+    with_ring(|ring| ring.in_flight())
+}
+
 fn with_current<R>(f: impl FnOnce(&Runtime) -> R) -> R {
     CURRENT.with(|cell| {
         let runtime = cell.borrow();

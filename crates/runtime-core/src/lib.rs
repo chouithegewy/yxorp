@@ -23,8 +23,9 @@ pub mod slab;
 pub mod timer;
 
 pub use buf::{IoBuf, IoBufMut};
-pub use executor::{block_on, is_runtime_available, spawn_local, JoinHandle};
+pub use executor::{block_on, in_flight, is_runtime_available, spawn_local, JoinHandle};
 pub use net::{TcpListener, TcpStream};
+pub use timer::{sleep, timeout, Elapsed, Sleep};
 
 #[cfg(test)]
 mod reactor_tests {
