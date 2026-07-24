@@ -28,7 +28,7 @@ pub use executor::{
     block_on, current_ring_fd, in_flight, is_runtime_available, post_message, recv_message,
     spawn_local, JoinHandle,
 };
-pub use net::{TcpListener, TcpStream};
+pub use net::{AcceptStream, TcpListener, TcpStream};
 pub use shard::{num_cpus, spawn_shards};
 pub use timer::{sleep, timeout, Elapsed, Sleep};
 

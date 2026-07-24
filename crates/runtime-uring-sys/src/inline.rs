@@ -10,7 +10,9 @@ use std::os::raw::{c_int, c_uint, c_void};
 
 use libc::{sockaddr, socklen_t};
 
-use crate::ffi::{__kernel_timespec, io_uring, io_uring_cqe, io_uring_probe, io_uring_sqe};
+use crate::ffi::{
+    __kernel_timespec, io_uring, io_uring_buf_ring, io_uring_cqe, io_uring_probe, io_uring_sqe,
+};
 
 unsafe extern "C" {
     // Submission / completion queue plumbing.
@@ -117,6 +119,41 @@ unsafe extern "C" {
         data: u64,
         flags: c_uint,
     );
+
+    // Multishot ops (Phase 3): one SQE yields many CQEs.
+    pub fn io_uring_prep_multishot_accept(
+        sqe: *mut io_uring_sqe,
+        fd: c_int,
+        addr: *mut sockaddr,
+        addrlen: *mut socklen_t,
+        flags: c_int,
+    );
+    pub fn io_uring_prep_multishot_accept_direct(
+        sqe: *mut io_uring_sqe,
+        fd: c_int,
+        addr: *mut sockaddr,
+        addrlen: *mut socklen_t,
+        flags: c_int,
+    );
+    pub fn io_uring_prep_recv_multishot(
+        sqe: *mut io_uring_sqe,
+        fd: c_int,
+        buf: *mut c_void,
+        len: usize,
+        flags: c_int,
+    );
+
+    // Provided buffer rings (Phase 3).
+    pub fn io_uring_buf_ring_add(
+        br: *mut io_uring_buf_ring,
+        addr: *mut c_void,
+        len: c_uint,
+        bid: u16,
+        mask: c_int,
+        buf_offset: c_int,
+    );
+    pub fn io_uring_buf_ring_advance(br: *mut io_uring_buf_ring, count: c_int);
+    pub fn io_uring_buf_ring_mask(ring_entries: u32) -> c_int;
 }
 
 /// `IOSQE_FIXED_FILE` flag value: `1 << IOSQE_FIXED_FILE_BIT`. bindgen only exposes the
@@ -127,3 +164,7 @@ pub const IOSQE_FIXED_FILE: u32 = 1 << 0;
 /// Passed as `file_index` to a direct op to auto-allocate a free fixed-file slot; the
 /// chosen index is returned in `cqe.res`. Equals `IORING_FILE_INDEX_ALLOC` (`~0u32`).
 pub const FILE_INDEX_ALLOC: u32 = u32::MAX;
+
+/// `IOSQE_BUFFER_SELECT` flag: `1 << IOSQE_BUFFER_SELECT_BIT`. Set on a recv SQE to
+/// have the kernel pick a buffer from the provided-buffer ring for the op's group.
+pub const IOSQE_BUFFER_SELECT: u32 = 1 << 5;

@@ -202,6 +202,19 @@ impl TcpListener {
         getsockname(self.fd)
     }
 
+    /// A multishot accept stream: one SQE that keeps yielding accepted connections,
+    /// eliminating the per-connection accept submission. Peer addresses are not
+    /// reported on this path (multishot reuses one address buffer). Uses
+    /// direct-descriptor accept when the ring supports it.
+    pub fn accept_multishot(&self) -> AcceptStream {
+        AcceptStream {
+            fd: self.fd,
+            direct: with_ring(|ring| ring.has_fixed_files()),
+            key: None,
+            done: false,
+        }
+    }
+
     /// Accept one connection. Uses direct-descriptor accept when the ring supports it.
     pub fn accept(&self) -> AcceptFut {
         AcceptFut {
@@ -304,6 +317,104 @@ impl Future for AcceptFut {
                 this.done = true;
                 Poll::Ready(Err(err))
             }
+        }
+    }
+}
+
+/// A stream of accepted connections backed by a single multishot accept SQE.
+pub struct AcceptStream {
+    fd: RawFd,
+    direct: bool,
+    key: Option<OpKey>,
+    done: bool,
+}
+
+impl AcceptStream {
+    /// Await the next accepted connection. Returns an error once the multishot op
+    /// terminates (e.g. the listener closed or the kernel dropped the request); the
+    /// caller may re-arm by calling [`TcpListener::accept_multishot`] again.
+    pub async fn accept(&mut self) -> io::Result<TcpStream> {
+        std::future::poll_fn(|cx| self.poll_accept(cx)).await
+    }
+
+    fn poll_accept(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<TcpStream>> {
+        if self.done {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "accept stream terminated",
+            )));
+        }
+        // Arm the multishot accept on first poll.
+        let key = match self.key {
+            Some(key) => key,
+            None => {
+                let fd = self.fd;
+                let direct = self.direct;
+                let key = with_ring(|ring| {
+                    ring.submit_op(None, move |sqe| unsafe {
+                        if direct {
+                            inline::io_uring_prep_multishot_accept_direct(
+                                sqe,
+                                fd,
+                                std::ptr::null_mut(),
+                                std::ptr::null_mut(),
+                                0,
+                            );
+                        } else {
+                            inline::io_uring_prep_multishot_accept(
+                                sqe,
+                                fd,
+                                std::ptr::null_mut(),
+                                std::ptr::null_mut(),
+                                0,
+                            );
+                        }
+                    })
+                });
+                match key {
+                    Ok(key) => {
+                        self.key = Some(key);
+                        key
+                    }
+                    Err(err) => {
+                        self.done = true;
+                        return Poll::Ready(Err(err));
+                    }
+                }
+            }
+        };
+
+        match with_ring(|ring| ring.poll_multishot(key, cx.waker())) {
+            crate::ring::MultishotPoll::Value(result) => {
+                if result.res < 0 {
+                    Poll::Ready(Err(io::Error::from_raw_os_error(-result.res)))
+                } else if self.direct {
+                    Poll::Ready(Ok(TcpStream {
+                        fd: Fd::Fixed(result.res as u32),
+                    }))
+                } else {
+                    Poll::Ready(Ok(TcpStream {
+                        fd: Fd::Raw(result.res),
+                    }))
+                }
+            }
+            crate::ring::MultishotPoll::Done(_) => {
+                self.done = true;
+                self.key = None;
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "accept stream terminated",
+                )))
+            }
+            crate::ring::MultishotPoll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for AcceptStream {
+    fn drop(&mut self) {
+        if let Some(key) = self.key {
+            with_ring(|ring| ring.orphan(key));
         }
     }
 }
