@@ -19,12 +19,14 @@ pub mod fut;
 pub mod net;
 pub mod op;
 pub mod ring;
+pub mod shard;
 pub mod slab;
 pub mod timer;
 
 pub use buf::{IoBuf, IoBufMut};
 pub use executor::{block_on, in_flight, is_runtime_available, spawn_local, JoinHandle};
 pub use net::{TcpListener, TcpStream};
+pub use shard::{num_cpus, spawn_shards};
 pub use timer::{sleep, timeout, Elapsed, Sleep};
 
 #[cfg(test)]
