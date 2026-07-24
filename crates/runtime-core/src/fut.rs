@@ -60,7 +60,7 @@ impl<P: FnOnce(*mut ffi::io_uring_sqe) + Unpin> Future for OpFuture<P> {
         // Already submitted: just check for the terminal completion.
         if let Some(key) = this.key {
             return match with_ring(|ring| ring.poll_op(key, cx.waker())) {
-                Some(result) => Poll::Ready(this.finish(result)),
+                Some((result, _keepalive)) => Poll::Ready(this.finish(result)),
                 None => Poll::Pending,
             };
         }
@@ -79,7 +79,7 @@ impl<P: FnOnce(*mut ffi::io_uring_sqe) + Unpin> Future for OpFuture<P> {
         // Park on the freshly-registered op (it cannot be complete yet — not even
         // submitted — so this stores our waker and returns Pending).
         match with_ring(|ring| ring.poll_op(key, cx.waker())) {
-            Some(result) => Poll::Ready(this.finish(result)),
+            Some((result, _keepalive)) => Poll::Ready(this.finish(result)),
             None => Poll::Pending,
         }
     }

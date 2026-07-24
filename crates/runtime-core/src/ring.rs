@@ -131,22 +131,37 @@ impl Ring {
         Ok(key)
     }
 
-    /// Poll an operation's terminal result. Returns `Some` (and frees the slot) once
-    /// the CQE has arrived; otherwise parks `waker` and returns `None`.
-    pub(crate) fn poll_op(&mut self, key: OpKey, waker: &std::task::Waker) -> Option<CqeResult> {
-        match self.ops.get_mut(key) {
-            None => None,
-            Some(op) => match &mut op.state {
-                OpState::Complete(result) => {
-                    let result = *result;
-                    self.ops.remove(key);
-                    Some(result)
-                }
-                OpState::Waiting(slot) => {
-                    *slot = Some(waker.clone());
-                    None
-                }
-            },
+    /// Poll an operation's terminal result. Returns `Some((result, keepalive))` — and
+    /// frees the slot, handing the retained buffer back to the caller — once the CQE
+    /// has arrived; otherwise parks `waker` and returns `None`.
+    pub(crate) fn poll_op(
+        &mut self,
+        key: OpKey,
+        waker: &std::task::Waker,
+    ) -> Option<(CqeResult, Option<Box<dyn std::any::Any>>)> {
+        let complete = matches!(self.ops.get_mut(key)?.state, OpState::Complete(_));
+        if complete {
+            let op = self.ops.remove(key).expect("op present");
+            match op.state {
+                OpState::Complete(result) => Some((result, op.keepalive)),
+                OpState::Waiting(_) => unreachable!("checked Complete above"),
+            }
+        } else {
+            if let Some(op) = self.ops.get_mut(key)
+                && let OpState::Waiting(slot) = &mut op.state
+            {
+                *slot = Some(waker.clone());
+            }
+            None
+        }
+    }
+
+    /// Attach kernel-visible memory to an already-submitted op. Used by buffer ops,
+    /// which move the buffer into the slot only after a successful submit so it can be
+    /// handed back to the caller if submission fails.
+    pub(crate) fn attach_keepalive(&mut self, key: OpKey, keepalive: Box<dyn std::any::Any>) {
+        if let Some(op) = self.ops.get_mut(key) {
+            op.keepalive = Some(keepalive);
         }
     }
 
