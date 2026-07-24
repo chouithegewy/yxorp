@@ -19,12 +19,16 @@ use crate::slab::{OpKey, OpSlab};
 /// zero-copy notifications in later phases can produce more CQEs than SQEs).
 const SQ_ENTRIES: u32 = 256;
 const CQ_ENTRIES: u32 = 1024;
+/// Size of the per-ring sparse fixed-file table. Accepted/outbound sockets are
+/// installed here as direct descriptors (Phase 2), skipping per-op fd refcounting.
+const FIXED_FILE_SLOTS: u32 = 4096;
 
 pub struct Ring {
     // Boxed so its address is stable across moves into the runtime's Rc.
     ring: Box<ffi::io_uring>,
     ops: OpSlab<Op>,
     caps: KernelCaps,
+    fixed_files: bool,
 }
 
 impl Ring {
@@ -63,10 +67,18 @@ impl Ring {
             };
             if rc == 0 {
                 let _ = cq;
+                // Register a sparse fixed-file table so accepted/outbound sockets can
+                // live as direct descriptors. Best-effort: on failure we fall back to
+                // raw-fd sockets.
+                let fixed_files = caps.sparse_files
+                    && unsafe {
+                        ffi::io_uring_register_files_sparse(ring.as_mut(), FIXED_FILE_SLOTS) == 0
+                    };
                 return Ok(Ring {
                     ring,
                     ops: OpSlab::with_capacity(SQ_ENTRIES as usize),
                     caps,
+                    fixed_files,
                 });
             }
             if flags == 0 {
@@ -78,6 +90,16 @@ impl Ring {
 
     pub fn caps(&self) -> &KernelCaps {
         &self.caps
+    }
+
+    /// Whether a sparse fixed-file table is registered (direct descriptors usable).
+    pub(crate) fn has_fixed_files(&self) -> bool {
+        self.fixed_files
+    }
+
+    /// The underlying io_uring fd, used as the target of an `MSG_RING` from a peer shard.
+    pub(crate) fn ring_fd(&self) -> i32 {
+        self.ring.ring_fd
     }
 
     /// Number of operations currently in flight (submitted or awaiting drain).
