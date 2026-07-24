@@ -14,13 +14,23 @@ use runtime_uring_sys::ffi;
 use runtime_uring_sys::inline;
 use runtime_uring_sys::KernelCaps;
 
-use crate::op::{CqeResult, Op, OpState};
+use crate::op::{CqeResult, Op};
 use crate::slab::{OpKey, OpSlab};
 
 /// Top `user_data` bit, set on `MSG_RING`-delivered completions to distinguish a
 /// cross-shard message from an op completion. Our [`OpKey`]s pack a small slot index
 /// into bits 32..63, so bit 63 is always clear for them.
 const MSG_TAG: u64 = 1 << 63;
+
+/// One step of consuming a multishot op's completions.
+pub(crate) enum MultishotPoll {
+    /// A completion is ready.
+    Value(CqeResult),
+    /// The op has terminated (no `IORING_CQE_F_MORE`); its keepalive is returned.
+    Done(Option<Box<dyn std::any::Any>>),
+    /// No completion yet; the waker is parked.
+    Pending,
+}
 
 /// Default submission-queue depth. The completion queue is sized larger (multishot /
 /// zero-copy notifications in later phases can produce more CQEs than SQEs).
@@ -179,7 +189,7 @@ impl Ring {
         keepalive: Option<Box<dyn std::any::Any>>,
         prep: impl FnOnce(*mut ffi::io_uring_sqe),
     ) -> io::Result<OpKey> {
-        let key = self.ops.insert(Op::waiting(keepalive));
+        let key = self.ops.insert(Op::new(keepalive));
         let sqe = match self.next_sqe() {
             Ok(sqe) => sqe,
             Err(err) => {
@@ -201,20 +211,45 @@ impl Ring {
         key: OpKey,
         waker: &std::task::Waker,
     ) -> Option<(CqeResult, Option<Box<dyn std::any::Any>>)> {
-        let complete = matches!(self.ops.get_mut(key)?.state, OpState::Complete(_));
-        if complete {
-            let op = self.ops.remove(key).expect("op present");
-            match op.state {
-                OpState::Complete(result) => Some((result, op.keepalive)),
-                OpState::Waiting(_) => unreachable!("checked Complete above"),
+        let result = {
+            let op = self.ops.get_mut(key)?;
+            match op.results.pop_front() {
+                Some(result) => result,
+                None => {
+                    op.waker = Some(waker.clone());
+                    return None;
+                }
             }
-        } else {
-            if let Some(op) = self.ops.get_mut(key)
-                && let OpState::Waiting(slot) = &mut op.state
-            {
-                *slot = Some(waker.clone());
+        };
+        // Single-shot: the one completion is terminal, so free the slot and hand back
+        // the retained buffer.
+        let op = self.ops.remove(key).expect("op present");
+        Some((result, op.keepalive))
+    }
+
+    /// Consume the next completion of a multishot op (accept/recv). Unlike [`poll_op`]
+    /// the slot survives across completions until the op terminates.
+    pub(crate) fn poll_multishot(&mut self, key: OpKey, waker: &std::task::Waker) -> MultishotPoll {
+        let step = match self.ops.get_mut(key) {
+            None => return MultishotPoll::Done(None),
+            Some(op) => {
+                if let Some(result) = op.results.pop_front() {
+                    return MultishotPoll::Value(result);
+                }
+                if op.terminated {
+                    None
+                } else {
+                    op.waker = Some(waker.clone());
+                    Some(())
+                }
             }
-            None
+        };
+        match step {
+            Some(()) => MultishotPoll::Pending,
+            None => {
+                let op = self.ops.remove(key);
+                MultishotPoll::Done(op.and_then(|op| op.keepalive))
+            }
         }
     }
 
@@ -239,14 +274,12 @@ impl Ring {
         }
         let action = match self.ops.get_mut(key) {
             None => Action::None,
-            Some(op) => match op.state {
-                OpState::Complete(_) => Action::Free,
-                OpState::Waiting(_) => {
-                    op.orphaned = true;
-                    op.state = OpState::Waiting(None); // drop the stale waker
-                    Action::Cancel
-                }
-            },
+            Some(op) if op.terminated => Action::Free,
+            Some(op) => {
+                op.orphaned = true;
+                op.waker = None; // drop the stale waker
+                Action::Cancel
+            }
         };
         match action {
             Action::None => {}
@@ -344,16 +377,24 @@ impl Ring {
                 continue;
             }
             let key = OpKey::from_u64(data);
+            let more = flags & ffi::IORING_CQE_F_MORE != 0;
             let action = match self.ops.get_mut(key) {
                 None => Action::Ignore,
-                Some(op) if op.orphaned => Action::Free,
                 Some(op) => {
-                    let waker = match &mut op.state {
-                        OpState::Waiting(slot) => slot.take(),
-                        OpState::Complete(_) => None,
-                    };
-                    op.state = OpState::Complete(CqeResult { res, flags });
-                    Action::Wake(waker)
+                    op.results.push_back(CqeResult { res, flags });
+                    if !more {
+                        op.terminated = true;
+                    }
+                    if op.orphaned {
+                        // Reap only once no more completions can arrive.
+                        if op.terminated {
+                            Action::Free
+                        } else {
+                            Action::Ignore
+                        }
+                    } else {
+                        Action::Wake(op.waker.take())
+                    }
                 }
             };
             match action {
