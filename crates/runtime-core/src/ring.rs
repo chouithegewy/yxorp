@@ -14,6 +14,7 @@ use runtime_uring_sys::ffi;
 use runtime_uring_sys::inline;
 use runtime_uring_sys::KernelCaps;
 
+use crate::bufring::{BufRing, BUF_RING_ENTRIES, BUF_SIZE};
 use crate::op::{CqeResult, Op};
 use crate::slab::{OpKey, OpSlab};
 
@@ -49,6 +50,8 @@ pub struct Ring {
     /// Cross-shard messages delivered to this ring via `MSG_RING`, awaiting a receiver.
     inbox: VecDeque<u64>,
     inbox_waker: Option<Waker>,
+    /// Default provided-buffer ring, created lazily on first multishot recv.
+    buf_ring: Option<BufRing>,
 }
 
 impl Ring {
@@ -101,6 +104,7 @@ impl Ring {
                     fixed_files,
                     inbox: VecDeque::new(),
                     inbox_waker: None,
+                    buf_ring: None,
                 });
             }
             if flags == 0 {
@@ -150,6 +154,30 @@ impl Ring {
     /// legitimate reason for the executor to block on the ring).
     pub(crate) fn has_inbox_waiter(&self) -> bool {
         self.inbox_waker.is_some()
+    }
+
+    /// Ensure the default provided-buffer ring exists, returning its group id.
+    pub(crate) fn ensure_buf_ring(&mut self) -> io::Result<u16> {
+        if self.buf_ring.is_none() {
+            let br = BufRing::new(self.ring.as_mut(), 0, BUF_RING_ENTRIES, BUF_SIZE)?;
+            self.buf_ring = Some(br);
+        }
+        Ok(self.buf_ring.as_ref().expect("buf ring present").bgid())
+    }
+
+    /// Pointer to a provided buffer's storage (valid while this ring lives).
+    pub(crate) fn buf_ring_ptr(&self, bid: u16) -> *const u8 {
+        self.buf_ring
+            .as_ref()
+            .expect("buf ring present")
+            .buffer_ptr(bid)
+    }
+
+    /// Return a consumed provided buffer to the ring for reuse.
+    pub(crate) fn buf_ring_recycle(&mut self, bid: u16) {
+        if let Some(br) = self.buf_ring.as_mut() {
+            br.recycle(bid);
+        }
     }
 
     /// Number of operations currently in flight (submitted or awaiting drain).
@@ -460,8 +488,12 @@ impl Ring {
 
 impl Drop for Ring {
     fn drop(&mut self) {
-        // Reap any stragglers (idempotent if the executor already drained), then exit.
+        // Reap any stragglers (idempotent if the executor already drained), then free
+        // the provided-buffer ring, then exit.
         self.shutdown();
+        if let Some(mut br) = self.buf_ring.take() {
+            br.free(self.ring.as_mut());
+        }
         unsafe { ffi::io_uring_queue_exit(self.ring.as_mut()) };
     }
 }

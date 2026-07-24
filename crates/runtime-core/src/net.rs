@@ -498,6 +498,19 @@ impl TcpStream {
         BufFut::new(self.fd, Dir::Recv, 0, buf)
     }
 
+    /// A multishot receive stream backed by the provided-buffer ring: one SQE keeps
+    /// yielding kernel-selected buffers as data arrives, with no per-read buffer
+    /// submission. Each [`BufLease`] recycles its buffer when dropped.
+    pub fn recv_multishot(&self) -> io::Result<RecvStream> {
+        let bgid = with_ring(|ring| ring.ensure_buf_ring())?;
+        Ok(RecvStream {
+            fd: self.fd,
+            bgid,
+            key: None,
+            done: false,
+        })
+    }
+
     /// Send an owned buffer's initialized bytes (may be partial; see [`send_all`]).
     pub fn send<B: IoBufMut>(&self, buf: B) -> BufFut<B> {
         BufFut::new(self.fd, Dir::Send, 0, buf)
@@ -714,6 +727,125 @@ impl<B: IoBufMut> Future for BufFut<B> {
 }
 
 impl<B: IoBufMut> Drop for BufFut<B> {
+    fn drop(&mut self) {
+        if let Some(key) = self.key {
+            with_ring(|ring| ring.orphan(key));
+        }
+    }
+}
+
+// ---- multishot recv over the provided-buffer ring -------------------------------
+
+/// A borrowed view of a kernel-selected buffer holding received bytes. Dereferences
+/// to the received `&[u8]`; recycles the buffer back to the provided-buffer ring when
+/// dropped, so hold it only as long as you need the data.
+pub struct BufLease {
+    bid: u16,
+    ptr: *const u8,
+    len: usize,
+}
+
+impl std::ops::Deref for BufLease {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        // SAFETY: ptr/len name a live provided buffer for this lease's lifetime; the
+        // arena outlives the lease (both owned by the runtime on this thread).
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl Drop for BufLease {
+    fn drop(&mut self) {
+        let bid = self.bid;
+        with_ring(|ring| ring.buf_ring_recycle(bid));
+    }
+}
+
+/// A multishot receive stream: one SQE that keeps delivering [`BufLease`]s as data
+/// arrives on the socket.
+pub struct RecvStream {
+    fd: Fd,
+    bgid: u16,
+    key: Option<OpKey>,
+    done: bool,
+}
+
+impl RecvStream {
+    /// Await the next chunk of received data, or `None` at end of stream.
+    pub async fn recv(&mut self) -> io::Result<Option<BufLease>> {
+        std::future::poll_fn(|cx| self.poll_recv(cx)).await
+    }
+
+    fn arm(&mut self) -> io::Result<OpKey> {
+        let fd = self.fd;
+        let bgid = self.bgid;
+        with_ring(|ring| {
+            ring.submit_op(None, move |sqe| unsafe {
+                inline::io_uring_prep_recv_multishot(sqe, fd.arg(), std::ptr::null_mut(), 0, 0);
+                (*sqe).__bindgen_anon_4.buf_group = bgid;
+                let mut flags = inline::IOSQE_BUFFER_SELECT;
+                if let Fd::Fixed(_) = fd {
+                    flags |= inline::IOSQE_FIXED_FILE;
+                }
+                inline::io_uring_sqe_set_flags(sqe, flags);
+            })
+        })
+    }
+
+    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<BufLease>>> {
+        if self.done {
+            return Poll::Ready(Ok(None));
+        }
+        let key = match self.key {
+            Some(key) => key,
+            None => match self.arm() {
+                Ok(key) => {
+                    self.key = Some(key);
+                    key
+                }
+                Err(err) => {
+                    self.done = true;
+                    return Poll::Ready(Err(err));
+                }
+            },
+        };
+
+        match with_ring(|ring| ring.poll_multishot(key, cx.waker())) {
+            crate::ring::MultishotPoll::Value(result) => {
+                if result.res == 0 {
+                    // EOF.
+                    self.done = true;
+                    Poll::Ready(Ok(None))
+                } else if result.res < 0 {
+                    let errno = -result.res;
+                    if errno == libc::ENOBUFS {
+                        // Ran out of provided buffers; the op terminated. Re-arm and
+                        // try again (buffers are recycled as leases drop).
+                        self.key = None;
+                        self.poll_recv(cx)
+                    } else {
+                        self.done = true;
+                        Poll::Ready(Err(io::Error::from_raw_os_error(errno)))
+                    }
+                } else {
+                    let bid = (result.flags >> runtime_uring_sys::ffi::IORING_CQE_BUFFER_SHIFT)
+                        as u16;
+                    let len = result.res as usize;
+                    let ptr = with_ring(|ring| ring.buf_ring_ptr(bid));
+                    Poll::Ready(Ok(Some(BufLease { bid, ptr, len })))
+                }
+            }
+            crate::ring::MultishotPoll::Done(_) => {
+                self.done = true;
+                self.key = None;
+                Poll::Ready(Ok(None))
+            }
+            crate::ring::MultishotPoll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for RecvStream {
     fn drop(&mut self) {
         if let Some(key) = self.key {
             with_ring(|ring| ring.orphan(key));
