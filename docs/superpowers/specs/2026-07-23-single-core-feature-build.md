@@ -144,3 +144,38 @@ buffers + read-all-available → fewer syscalls/wakeups per MiB), which directly
 the large-body gap. **Tier 3** (atomic elision) will not close an I/O-loop gap and is
 deprioritized — measure before investing. `zero_copy` default off (Tier 1) is confirmed
 correct for this target.
+
+## Post-implementation results (Tier 1 + Tier 2, same box/harness, 2-run median)
+
+Single-core release build (`--no-default-features --features single-core`): `zero_copy`
+off by default, 64 KiB `BODY_CHUNK_BYTES` (16 KiB header/init), `rt-multi-thread`
+dropped.
+
+**Large 1 MiB (bandwidth-bound):**
+
+| Proxy | Gb/s | vs HAProxy | Before Tier 1 |
+|-------|-----:|-----------:|--------------:|
+| HAProxy nbthread=1 | ~7.9 | 1.00 | 1.00 |
+| yxorp single-core, zc=off | **~7.9** | **~1.00** | 0.65 |
+| yxorp single-core, zc=on (splice) | ~3.9 | ~0.49 | 0.40 |
+
+**Small 64 B (RPS-bound):**
+
+| Proxy | rps | vs HAProxy |
+|-------|----:|-----------:|
+| HAProxy nbthread=1 | ~20k | 1.00 |
+| yxorp single-core | ~18k | ~0.90 |
+
+**Outcome:**
+- **Large-body throughput reached parity with HAProxy (~100 %, up from 65 %)** — the
+  64 KiB `BODY_CHUNK_BYTES` closed the entire gap, confirming it was syscall-count /
+  I/O-loop bound, not atomics. Tier 3 not needed for this.
+- **Small-request RPS ~90 % of HAProxy** — competitive; decoupling the header-read
+  chunk (kept 16 KiB) from the body chunk recovered the ~10 % dip the initial flat
+  64 KiB buffer caused (it had been zeroing 64 KiB per tiny-header read).
+- **splice reproducibly ~half throughput on one core** → `zero_copy` default off
+  validated against the reference.
+
+Remaining small-request headroom vs HAProxy's hand-rolled epoll loop is a possible
+Tier-3 / per-request-overhead follow-up, but the primary single-core goal (large-body
+throughput parity) is met.
