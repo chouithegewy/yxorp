@@ -29,6 +29,11 @@ pub struct KernelCaps {
     pub op_timeout: bool,
     pub op_link_timeout: bool,
     pub op_async_cancel: bool,
+    pub op_socket: bool,
+    pub op_msg_ring: bool,
+    // Registration capabilities (Phase 2).
+    pub sparse_files: bool,
+    pub register_ring_fd: bool,
 }
 
 impl KernelCaps {
@@ -60,7 +65,14 @@ impl KernelCaps {
             ..Default::default()
         };
         caps.probe_opcodes();
+        caps.probe_registration();
         Some(caps)
+    }
+
+    /// Whether direct (fixed) descriptors — sparse file table + direct accept/socket —
+    /// are usable. Later phases treat this as the normal socket path.
+    pub fn direct_descriptors_supported(&self) -> bool {
+        self.sparse_files && self.op_accept && self.op_socket
     }
 
     /// The flag set the runtime prefers, masked to what this kernel actually supports.
@@ -120,7 +132,23 @@ impl KernelCaps {
             self.op_timeout = supported(IORING_OP_TIMEOUT);
             self.op_link_timeout = supported(IORING_OP_LINK_TIMEOUT);
             self.op_async_cancel = supported(IORING_OP_ASYNC_CANCEL);
+            self.op_socket = supported(IORING_OP_SOCKET);
+            self.op_msg_ring = supported(IORING_OP_MSG_RING);
             ffi::io_uring_free_probe(probe);
+        }
+    }
+
+    /// Probe registration features by attempting them on a throwaway ring.
+    fn probe_registration(&mut self) {
+        unsafe {
+            let mut ring: ffi::io_uring = std::mem::zeroed();
+            if ffi::io_uring_queue_init(8, &mut ring, 0) != 0 {
+                return;
+            }
+            self.sparse_files = ffi::io_uring_register_files_sparse(&mut ring, 8) == 0;
+            // register_ring_fd returns 1 (count) on success, negative errno on failure.
+            self.register_ring_fd = ffi::io_uring_register_ring_fd(&mut ring) >= 0;
+            ffi::io_uring_queue_exit(&mut ring);
         }
     }
 }
@@ -130,10 +158,12 @@ impl fmt::Display for KernelCaps {
         write!(
             f,
             "io_uring caps: setup[single_issuer={} defer_taskrun={} taskrun_flag={} submit_all={} cqsize={} no_sqarray={}] \
-             ops[accept={} connect={} recv={} send={} read={} write={} close={} timeout={} link_timeout={} async_cancel={}]",
+             ops[accept={} connect={} recv={} send={} read={} write={} close={} timeout={} link_timeout={} async_cancel={} socket={} msg_ring={}] \
+             reg[sparse_files={} register_ring_fd={}]",
             self.single_issuer, self.defer_taskrun, self.taskrun_flag, self.submit_all, self.cqsize, self.no_sqarray,
             self.op_accept, self.op_connect, self.op_recv, self.op_send, self.op_read, self.op_write,
-            self.op_close, self.op_timeout, self.op_link_timeout, self.op_async_cancel,
+            self.op_close, self.op_timeout, self.op_link_timeout, self.op_async_cancel, self.op_socket, self.op_msg_ring,
+            self.sparse_files, self.register_ring_fd,
         )
     }
 }

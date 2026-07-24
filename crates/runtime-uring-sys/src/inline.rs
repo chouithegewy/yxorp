@@ -90,4 +90,40 @@ unsafe extern "C" {
         flags: c_uint,
     );
     pub fn io_uring_prep_cancel64(sqe: *mut io_uring_sqe, user_data: u64, flags: c_int);
+
+    // Direct (fixed) descriptor prep helpers (Phase 2).
+    pub fn io_uring_prep_accept_direct(
+        sqe: *mut io_uring_sqe,
+        fd: c_int,
+        addr: *mut sockaddr,
+        addrlen: *mut socklen_t,
+        flags: c_int,
+        file_index: c_uint,
+    );
+    pub fn io_uring_prep_socket_direct_alloc(
+        sqe: *mut io_uring_sqe,
+        domain: c_int,
+        socket_type: c_int,
+        protocol: c_int,
+        flags: c_uint,
+    );
+    pub fn io_uring_prep_close_direct(sqe: *mut io_uring_sqe, file_index: c_uint);
+
+    // Cross-ring messaging (Phase 2).
+    pub fn io_uring_prep_msg_ring(
+        sqe: *mut io_uring_sqe,
+        fd: c_int,
+        len: c_uint,
+        data: u64,
+        flags: c_uint,
+    );
 }
+
+/// `IOSQE_FIXED_FILE` flag value: `1 << IOSQE_FIXED_FILE_BIT`. bindgen only exposes the
+/// bit position, so we define the flag here. Set on an SQE to interpret its `fd` field
+/// as an index into the registered fixed-file table.
+pub const IOSQE_FIXED_FILE: u32 = 1 << 0;
+
+/// Passed as `file_index` to a direct op to auto-allocate a free fixed-file slot; the
+/// chosen index is returned in `cqe.res`. Equals `IORING_FILE_INDEX_ALLOC` (`~0u32`).
+pub const FILE_INDEX_ALLOC: u32 = u32::MAX;
