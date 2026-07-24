@@ -125,6 +125,16 @@ impl<T> OpSlab<T> {
         value
     }
 
+    /// Apply `f` to every occupied value. Used during shutdown to mark all
+    /// outstanding ops for reaping.
+    pub fn for_each_mut(&mut self, mut f: impl FnMut(&mut T)) {
+        for slot in &mut self.slots {
+            if let Some(value) = slot.value.as_mut() {
+                f(value);
+            }
+        }
+    }
+
     /// Whether `key` currently refers to a live slot.
     pub fn contains(&self, key: OpKey) -> bool {
         self.slots

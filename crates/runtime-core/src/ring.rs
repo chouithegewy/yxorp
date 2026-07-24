@@ -299,10 +299,45 @@ impl Ring {
         }
         count
     }
+
+    /// Queue a request that cancels every outstanding operation (untracked).
+    fn cancel_all(&mut self) {
+        if let Ok(sqe) = self.next_sqe() {
+            let flags = (ffi::IORING_ASYNC_CANCEL_ALL | ffi::IORING_ASYNC_CANCEL_ANY) as i32;
+            unsafe {
+                inline::io_uring_prep_cancel64(sqe, 0, flags);
+                inline::io_uring_sqe_set_data64(sqe, 0);
+            }
+        }
+    }
+
+    /// Deterministic teardown: cancel every outstanding operation and reap its
+    /// terminal completion before any buffer is freed, so the kernel is never left
+    /// holding memory we are about to drop. Bounded so a stuck completion cannot hang
+    /// teardown forever.
+    pub(crate) fn shutdown(&mut self) {
+        // Nothing will poll during teardown, so every remaining op must be freed by
+        // the drain itself.
+        self.ops.for_each_mut(|op| op.orphaned = true);
+        self.drain();
+        let mut guard = 0;
+        while !self.ops.is_empty() {
+            self.cancel_all();
+            let _ = self.submit_and_wait(1, Some(Duration::from_millis(200)));
+            self.drain();
+            guard += 1;
+            if guard > 1000 {
+                debug_assert!(false, "ring shutdown failed to reap all ops");
+                break;
+            }
+        }
+    }
 }
 
 impl Drop for Ring {
     fn drop(&mut self) {
+        // Reap any stragglers (idempotent if the executor already drained), then exit.
+        self.shutdown();
         unsafe { ffi::io_uring_queue_exit(self.ring.as_mut()) };
     }
 }

@@ -116,6 +116,20 @@ impl Runtime {
         }
     }
 
+    /// Tear the runtime down cleanly. Drops every still-pending task first (while the
+    /// runtime is installed, so their in-flight futures orphan their buffers via
+    /// `Drop`), then reaps all outstanding ops before the ring is exited.
+    fn shutdown(&self) {
+        // Release tasks without holding the table borrow across their drops (a drop
+        // may touch the ring/timers).
+        let tasks = std::mem::take(&mut *self.tasks.borrow_mut());
+        drop(tasks);
+        self.free.borrow_mut().clear();
+        self.shared.ready.borrow_mut().clear();
+        self.shared.queued.borrow_mut().clear();
+        self.ring.borrow_mut().shutdown();
+    }
+
     /// One wait/drain step. Only called when the ready queue is empty and the driver
     /// still has pending work (in-flight ops or armed timers).
     fn drive_io(&self) -> std::io::Result<()> {
@@ -162,6 +176,9 @@ where
             .expect("io_uring submit/wait failed while driving the runtime");
     };
 
+    // Cancel and reap any spawned-but-unfinished tasks and their in-flight ops before
+    // the runtime (and its buffers) are dropped.
+    runtime.shutdown();
     uninstall();
     result
 }
